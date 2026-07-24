@@ -407,6 +407,23 @@ async function _gerarBackup() {
     catalogo_autores:  autores.docs.map(d => ({ id: d.id, ...d.data() }))
   };
 
+  // Comentários pessoais (citacoes/{id}/privado/{uid}). Entram no backup para não se
+  // perderem, mas agrupados por dono e gravados numa subcoleção que NINGUÉM lê pelo site
+  // (rule `read: if false`) — nem o coordenador. Se a consulta falhar, o backup do resto
+  // continua: perder o backup inteiro por causa disso seria pior.
+  const privadosPorDono = {};
+  try {
+    const priv = await db.collectionGroup('privado').get();
+    priv.docs.forEach(d => {
+      const citacaoId = d.ref.parent.parent ? d.ref.parent.parent.id : null;
+      if (!citacaoId) return;
+      const uid = d.id;
+      (privadosPorDono[uid] = privadosPorDono[uid] || []).push({ citacaoId, ...d.data() });
+    });
+  } catch (e) {
+    console.error('Não foi possível ler os comentários pessoais:', e.message);
+  }
+
   const porCorrente = {};   // corrente -> array de citações
   const contagemTema = {};  // tema -> contagem
   todas.forEach(c => {
@@ -431,13 +448,16 @@ async function _gerarBackup() {
   await Promise.all(Object.entries(outras).map(([colecao, itens]) =>
     docRef.collection('outras_colecoes').doc(colecao).set({ colecao, itens })
   ));
+  await Promise.all(Object.entries(privadosPorDono).map(([uid, itens]) =>
+    docRef.collection('comentarios_privados').doc(uid).set({ uid, itens })
+  ));
 
   // Mantém só os últimos 90 backups (evita crescimento indefinido no plano free do Firestore)
   const antigos = await db.collection('backups').orderBy('gerado_em', 'desc').offset(90).limit(30).get();
   await Promise.all(antigos.docs.map(async d => {
     // Apagar TODAS as subcoleções — no Firestore, apagar o documento pai não apaga as filhas;
     // esquecer alguma aqui deixaria lixo órfão acumulando para sempre.
-    for (const sub of ['por_corrente', 'outras_colecoes']) {
+    for (const sub of ['por_corrente', 'outras_colecoes', 'comentarios_privados']) {
       const subs = await d.ref.collection(sub).get();
       await Promise.all(subs.docs.map(s => s.ref.delete()));
     }
@@ -478,6 +498,69 @@ app.post('/backup-agora', auth, async (req, res) => {
     res.json(await _gerarBackup());
   } catch (e) {
     console.error('Erro backup-agora:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* Migração única: comentários que hoje estão DENTRO de `citacoes/{id}` passam para
+ * `citacoes/{id}/privado/{uid}` (só o autor lê) e o campo some do documento público.
+ *
+ * Precisa rodar no servidor: pela regra do Firestore, ninguém pode escrever no espaço
+ * privado de outra pessoa — nem o coordenador. O Admin SDK ignora rules, então é o único
+ * caminho para migrar o comentário de cada pesquisador para o lugar certo, sem lê-lo aqui.
+ *
+ * Idempotente: rodar duas vezes não duplica nem apaga nada (na 2ª vez não há mais campo).
+ * `?simular=1` faz uma passagem seca, sem gravar — serve para conferir antes.
+ * A citação guarda o NOME do pesquisador, não o uid, então casamos pelo nome em `usuarios`;
+ * quem não casar é reportado e fica INTACTO (nunca descartamos comentário sem dono). */
+app.post('/migrar-comentarios', auth, async (req, res) => {
+  const db = _getDbBackup();
+  if (!db) return res.status(500).json({ error: 'Falta FIREBASE_SERVICE_ACCOUNT_JSON no servidor.' });
+  const simular = req.query.simular === '1';
+
+  try {
+    const [usuarios, citacoes] = await Promise.all([
+      db.collection('usuarios').get(),
+      db.collection('citacoes').get()
+    ]);
+
+    const uidPorNome = new Map();
+    usuarios.docs.forEach(u => {
+      const nome = (u.data().nome || '').trim();
+      if (nome) uidPorNome.set(nome.toLowerCase(), u.id);
+    });
+
+    let migrados = 0, semComentario = 0;
+    const semDono = [];
+    for (const doc of citacoes.docs) {
+      const d = doc.data();
+      const comentario = (d.comentario || '').trim();
+      if (!comentario) { semComentario++; continue; }
+
+      const uid = uidPorNome.get((d.pesquisador || '').trim().toLowerCase());
+      if (!uid) { semDono.push({ id: doc.id, pesquisador: d.pesquisador || '(sem nome)' }); continue; }
+
+      if (!simular) {
+        await doc.ref.collection('privado').doc(uid).set({
+          comentario, uid,
+          atualizado_em: admin.firestore.FieldValue.serverTimestamp(),
+          migrado_de: 'campo comentario da citação'
+        });
+        await doc.ref.update({ comentario: admin.firestore.FieldValue.delete() });
+      }
+      migrados++;
+    }
+
+    res.json({
+      ok: true, simulacao: simular,
+      total_citacoes: citacoes.size,
+      migrados, sem_comentario: semComentario,
+      sem_dono_identificado: semDono.length,
+      // Só id e nome do pesquisador — o texto do comentário não é devolvido, de propósito.
+      detalhe_sem_dono: semDono.slice(0, 20)
+    });
+  } catch (e) {
+    console.error('Erro migrar-comentarios:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
