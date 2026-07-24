@@ -67,6 +67,10 @@ function _getSheets() {
   return _sheetsApi;
 }
 
+const ABA_CITACOES = 'Citações';
+const ABA_CRITICA  = 'Crítica Literária';
+const ABA_AUTORES  = 'Correntes (autores)';
+
 const COLUNAS_SHEET = [
   'tipo', 'id', 'citacao', 'pagina', 'autor_obra', 'obra', 'corrente_critica',
   'tema', 'comentario', 'referencia_abnt', 'pesquisador', 'data_insercao',
@@ -83,27 +87,83 @@ function _dataLegivel(v) {
   } catch (_) { return ''; }
 }
 
+// Cria as abas que ainda não existem — assim o usuário só precisa criar a planilha vazia,
+// sem ter que acertar nomes de aba na mão.
+async function _garantirAbas(sheets, spreadsheetId, nomes) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId });
+  const existentes = (meta.data.sheets || []).map(s => s.properties.title);
+  const faltando = nomes.filter(n => !existentes.includes(n));
+  if (!faltando.length) return;
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests: faltando.map(title => ({ addSheet: { properties: { title } } })) }
+  });
+}
+
 // Reescreve a planilha inteira com o estado atual (limpa e regrava — idempotente).
 // Devolve { ok, erro } e NUNCA lança: falha na planilha não pode derrubar o backup real.
-async function _exportarParaSheets(todas) {
+async function _exportarParaSheets({ citacoes = [], critica = [], autores = [] }) {
   const sheets = _getSheets();
   if (!sheets) return { ok: false, erro: 'Planilha não configurada (falta GOOGLE_SHEET_ID ou credencial).' };
   const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+  const agora = new Date().toISOString().slice(0, 16).replace('T', ' ');
+
+  // Uma linha por citação
+  const linhasCitacoes = citacoes.map(c => [
+    c.tipo || '', c.id || '', c.citacao || '', c.pagina || '', c.autor_obra || '',
+    c.obra || '', c.corrente_critica || '', (c.tema || []).join('; '), c.comentario || '',
+    c.referencia_abnt || '', c.pesquisador || '', _dataLegivel(c.data_insercao),
+    c.atualizado_por || '', _dataLegivel(c.atualizado_em)
+  ]);
+
+  // Crítica Literária guarda `conceitos` como lista de objetos aninhados; a planilha é plana,
+  // então cada conceito vira uma linha, repetindo corrente/período. Correntes sem nenhum
+  // conceito ainda aparecem (uma linha), para não sumirem do espelho.
+  const linhasCritica = [];
+  critica.forEach(c => {
+    const conceitos = Array.isArray(c.conceitos) && c.conceitos.length ? c.conceitos : [null];
+    conceitos.forEach(k => linhasCritica.push([
+      c.id || '', c.corrente || '', c.periodo || '', c.ordem ?? '',
+      k ? (k.conceito || '') : '', k ? (k.definicao || '') : '',
+      k ? (k.exemplo || '') : '', k ? (k.fonte || '') : '',
+      c.atualizadoPor || '', _dataLegivel(c.atualizadoEm)
+    ]));
+  });
+
+  // `correntes` é uma lista (um autor pode transitar por várias) — vira texto separado por ";"
+  const linhasAutores = autores.map(a => [
+    a.id || '', a.autor || '',
+    Array.isArray(a.correntes) ? a.correntes.join('; ') : (a.correntes || ''),
+    a.contribuicoes || ''
+  ]);
+
+  const blocos = [
+    { aba: ABA_CITACOES, cabecalho: COLUNAS_SHEET, linhas: linhasCitacoes, rotulo: 'citações' },
+    { aba: ABA_CRITICA, rotulo: 'linhas de conceito',
+      cabecalho: ['id', 'corrente', 'periodo', 'ordem', 'conceito', 'definicao', 'exemplo', 'fonte', 'atualizadoPor', 'atualizadoEm'],
+      linhas: linhasCritica },
+    { aba: ABA_AUTORES, rotulo: 'autores',
+      cabecalho: ['id', 'autor', 'correntes', 'contribuicoes'],
+      linhas: linhasAutores }
+  ];
+
   try {
-    const linhas = todas.map(c => [
-      c.tipo || '', c.id || '', c.citacao || '', c.pagina || '', c.autor_obra || '',
-      c.obra || '', c.corrente_critica || '', (c.tema || []).join('; '), c.comentario || '',
-      c.referencia_abnt || '', c.pesquisador || '', _dataLegivel(c.data_insercao),
-      c.atualizado_por || '', _dataLegivel(c.atualizado_em)
-    ]);
-    // Rótulo de quando o espelho foi atualizado — some a dúvida de "isso está velho?"
-    const carimbo = [`Atualizado em ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC — ${todas.length} citações`];
-    await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'A:Z' });
-    await sheets.spreadsheets.values.update({
-      spreadsheetId, range: 'A1', valueInputOption: 'RAW',
-      requestBody: { values: [carimbo, COLUNAS_SHEET, ...linhas] }
-    });
-    return { ok: true, linhas: linhas.length };
+    await _garantirAbas(sheets, spreadsheetId, blocos.map(b => b.aba));
+    for (const b of blocos) {
+      const faixa = `'${b.aba}'`;
+      await sheets.spreadsheets.values.clear({ spreadsheetId, range: `${faixa}!A:Z` });
+      await sheets.spreadsheets.values.update({
+        spreadsheetId, range: `${faixa}!A1`, valueInputOption: 'RAW',
+        requestBody: {
+          values: [
+            [`Atualizado em ${agora} UTC — ${b.linhas.length} ${b.rotulo}`],
+            b.cabecalho,
+            ...b.linhas
+          ]
+        }
+      });
+    }
+    return { ok: true, citacoes: linhasCitacoes.length, critica: linhasCritica.length, autores: linhasAutores.length };
   } catch (e) {
     console.error('Erro ao exportar para Sheets:', e.message);
     return { ok: false, erro: e.message };
@@ -331,14 +391,21 @@ async function _gerarBackup() {
   const db = _getDbBackup();
   if (!db) throw new Error('Backup não configurado (falta FIREBASE_SERVICE_ACCOUNT_JSON).');
 
-  const [soltas, livro] = await Promise.all([
+  const [soltas, livro, critica, autores] = await Promise.all([
     db.collection('citacoes').get(),
-    db.collection('citacoes_livro').get()
+    db.collection('citacoes_livro').get(),
+    db.collection('critica_literaria').get(),
+    db.collection('catalogo_autores').get()
   ]);
   const todas = [
     ...soltas.docs.map(d => ({ tipo: 'solta', id: d.id, ...d.data() })),
     ...livro.docs.map(d => ({ tipo: 'livro', id: d.id, ...d.data() }))
   ];
+  // Coleções que não são citações: guardadas inteiras, sem agrupamento por corrente.
+  const outras = {
+    critica_literaria: critica.docs.map(d => ({ id: d.id, ...d.data() })),
+    catalogo_autores:  autores.docs.map(d => ({ id: d.id, ...d.data() }))
+  };
 
   const porCorrente = {};   // corrente -> array de citações
   const contagemTema = {};  // tema -> contagem
@@ -355,24 +422,40 @@ async function _gerarBackup() {
     total: todas.length,
     correntes: Object.keys(porCorrente).sort(),
     contagem_por_corrente: Object.fromEntries(Object.entries(porCorrente).map(([k, v]) => [k, v.length])),
-    contagem_por_tema: contagemTema
+    contagem_por_tema: contagemTema,
+    contagem_outras: Object.fromEntries(Object.entries(outras).map(([k, v]) => [k, v.length]))
   });
   await Promise.all(Object.entries(porCorrente).map(([corrente, itens]) =>
     docRef.collection('por_corrente').doc(_slug(corrente)).set({ corrente, citacoes: itens })
+  ));
+  await Promise.all(Object.entries(outras).map(([colecao, itens]) =>
+    docRef.collection('outras_colecoes').doc(colecao).set({ colecao, itens })
   ));
 
   // Mantém só os últimos 90 backups (evita crescimento indefinido no plano free do Firestore)
   const antigos = await db.collection('backups').orderBy('gerado_em', 'desc').offset(90).limit(30).get();
   await Promise.all(antigos.docs.map(async d => {
-    const subs = await d.ref.collection('por_corrente').get();
-    await Promise.all(subs.docs.map(s => s.ref.delete()));
+    // Apagar TODAS as subcoleções — no Firestore, apagar o documento pai não apaga as filhas;
+    // esquecer alguma aqui deixaria lixo órfão acumulando para sempre.
+    for (const sub of ['por_corrente', 'outras_colecoes']) {
+      const subs = await d.ref.collection(sub).get();
+      await Promise.all(subs.docs.map(s => s.ref.delete()));
+    }
     await d.ref.delete();
   }));
 
   // Espelho legível na planilha — se falhar, o backup real (acima) continua válido.
-  const planilha = await _exportarParaSheets(todas);
+  const planilha = await _exportarParaSheets({
+    citacoes: todas,
+    critica: outras.critica_literaria,
+    autores: outras.catalogo_autores
+  });
 
-  return { ok: true, data, total: todas.length, correntes: Object.keys(porCorrente).length, planilha };
+  return {
+    ok: true, data, total: todas.length, correntes: Object.keys(porCorrente).length,
+    outras: Object.fromEntries(Object.entries(outras).map(([k, v]) => [k, v.length])),
+    planilha
+  };
 }
 
 app.post('/backup-diario', async (req, res) => {
