@@ -16,6 +16,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const { google } = require('googleapis');
 
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'grupo-de-pesquisa-9e35f';
 admin.initializeApp({ projectId: PROJECT_ID }); // verifyIdToken não precisa de service account
@@ -35,6 +36,77 @@ function _getDbBackup() {
   } catch (e) {
     console.error('FIREBASE_SERVICE_ACCOUNT_JSON inválida:', e.message);
     return null;
+  }
+}
+
+/* ---------- Espelho em Google Sheets (planilha legível, sempre atualizada) ----------
+ * Usa a MESMA chave de serviço do Firebase (é uma conta de serviço do Google Cloud,
+ * serve para os dois). Para funcionar, o usuário precisa: (1) ativar a API do Google
+ * Sheets no projeto, (2) compartilhar a planilha com o e-mail da conta de serviço
+ * (endpoint /conta-servico devolve esse e-mail), (3) definir GOOGLE_SHEET_ID.
+ * A planilha é um ESPELHO de leitura — a restauração oficial usa o JSON, não ela,
+ * porque a planilha achata listas e datas em texto.
+ * --------------------------------------------------------------------------------- */
+function _credenciaisServico() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (_) { return null; }
+}
+
+let _sheetsApi = null;
+function _getSheets() {
+  if (_sheetsApi) return _sheetsApi;
+  const cred = _credenciaisServico();
+  if (!cred || !process.env.GOOGLE_SHEET_ID) return null;
+  const auth = new google.auth.JWT({
+    email: cred.client_email,
+    key: cred.private_key,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets']
+  });
+  _sheetsApi = google.sheets({ version: 'v4', auth });
+  return _sheetsApi;
+}
+
+const COLUNAS_SHEET = [
+  'tipo', 'id', 'citacao', 'pagina', 'autor_obra', 'obra', 'corrente_critica',
+  'tema', 'comentario', 'referencia_abnt', 'pesquisador', 'data_insercao',
+  'atualizado_por', 'atualizado_em'
+];
+
+// Timestamp do Firestore (ou string/Date) → texto legível AAAA-MM-DD HH:MM
+function _dataLegivel(v) {
+  if (!v) return '';
+  try {
+    if (typeof v.toDate === 'function') return v.toDate().toISOString().slice(0, 16).replace('T', ' ');
+    if (v instanceof Date) return v.toISOString().slice(0, 16).replace('T', ' ');
+    return String(v);
+  } catch (_) { return ''; }
+}
+
+// Reescreve a planilha inteira com o estado atual (limpa e regrava — idempotente).
+// Devolve { ok, erro } e NUNCA lança: falha na planilha não pode derrubar o backup real.
+async function _exportarParaSheets(todas) {
+  const sheets = _getSheets();
+  if (!sheets) return { ok: false, erro: 'Planilha não configurada (falta GOOGLE_SHEET_ID ou credencial).' };
+  const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+  try {
+    const linhas = todas.map(c => [
+      c.tipo || '', c.id || '', c.citacao || '', c.pagina || '', c.autor_obra || '',
+      c.obra || '', c.corrente_critica || '', (c.tema || []).join('; '), c.comentario || '',
+      c.referencia_abnt || '', c.pesquisador || '', _dataLegivel(c.data_insercao),
+      c.atualizado_por || '', _dataLegivel(c.atualizado_em)
+    ]);
+    // Rótulo de quando o espelho foi atualizado — some a dúvida de "isso está velho?"
+    const carimbo = [`Atualizado em ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC — ${todas.length} citações`];
+    await sheets.spreadsheets.values.clear({ spreadsheetId, range: 'A:Z' });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId, range: 'A1', valueInputOption: 'RAW',
+      requestBody: { values: [carimbo, COLUNAS_SHEET, ...linhas] }
+    });
+    return { ok: true, linhas: linhas.length };
+  } catch (e) {
+    console.error('Erro ao exportar para Sheets:', e.message);
+    return { ok: false, erro: e.message };
   }
 }
 
@@ -255,58 +327,88 @@ function _slug(s) {
 // guardando cada corrente numa subcoleção). Disparado por um cron externo grátis
 // (ex.: cron-job.org) — protegido por senha própria (BACKUP_SECRET), não pelo login,
 // porque quem chama não é um navegador logado.
+async function _gerarBackup() {
+  const db = _getDbBackup();
+  if (!db) throw new Error('Backup não configurado (falta FIREBASE_SERVICE_ACCOUNT_JSON).');
+
+  const [soltas, livro] = await Promise.all([
+    db.collection('citacoes').get(),
+    db.collection('citacoes_livro').get()
+  ]);
+  const todas = [
+    ...soltas.docs.map(d => ({ tipo: 'solta', id: d.id, ...d.data() })),
+    ...livro.docs.map(d => ({ tipo: 'livro', id: d.id, ...d.data() }))
+  ];
+
+  const porCorrente = {};   // corrente -> array de citações
+  const contagemTema = {};  // tema -> contagem
+  todas.forEach(c => {
+    const corrente = c.corrente_critica || 'Sem corrente';
+    (porCorrente[corrente] = porCorrente[corrente] || []).push(c);
+    (c.tema || []).forEach(t => { if (t) contagemTema[t] = (contagemTema[t] || 0) + 1; });
+  });
+
+  const data = new Date().toISOString().slice(0, 10);
+  const docRef = db.collection('backups').doc(data);
+  await docRef.set({
+    gerado_em: admin.firestore.FieldValue.serverTimestamp(),
+    total: todas.length,
+    correntes: Object.keys(porCorrente).sort(),
+    contagem_por_corrente: Object.fromEntries(Object.entries(porCorrente).map(([k, v]) => [k, v.length])),
+    contagem_por_tema: contagemTema
+  });
+  await Promise.all(Object.entries(porCorrente).map(([corrente, itens]) =>
+    docRef.collection('por_corrente').doc(_slug(corrente)).set({ corrente, citacoes: itens })
+  ));
+
+  // Mantém só os últimos 90 backups (evita crescimento indefinido no plano free do Firestore)
+  const antigos = await db.collection('backups').orderBy('gerado_em', 'desc').offset(90).limit(30).get();
+  await Promise.all(antigos.docs.map(async d => {
+    const subs = await d.ref.collection('por_corrente').get();
+    await Promise.all(subs.docs.map(s => s.ref.delete()));
+    await d.ref.delete();
+  }));
+
+  // Espelho legível na planilha — se falhar, o backup real (acima) continua válido.
+  const planilha = await _exportarParaSheets(todas);
+
+  return { ok: true, data, total: todas.length, correntes: Object.keys(porCorrente).length, planilha };
+}
+
 app.post('/backup-diario', async (req, res) => {
   const secret = req.headers['x-backup-secret'];
   if (!process.env.BACKUP_SECRET || secret !== process.env.BACKUP_SECRET) {
     return res.status(403).json({ error: 'Não autorizado.' });
   }
-  const db = _getDbBackup();
-  if (!db) return res.status(500).json({ error: 'Backup não configurado (falta FIREBASE_SERVICE_ACCOUNT_JSON).' });
-
   try {
-    const [soltas, livro] = await Promise.all([
-      db.collection('citacoes').get(),
-      db.collection('citacoes_livro').get()
-    ]);
-    const todas = [
-      ...soltas.docs.map(d => ({ tipo: 'solta', id: d.id, ...d.data() })),
-      ...livro.docs.map(d => ({ tipo: 'livro', id: d.id, ...d.data() }))
-    ];
-
-    const porCorrente = {};   // corrente -> array de citações
-    const contagemTema = {};  // tema -> contagem
-    todas.forEach(c => {
-      const corrente = c.corrente_critica || 'Sem corrente';
-      (porCorrente[corrente] = porCorrente[corrente] || []).push(c);
-      (c.tema || []).forEach(t => { if (t) contagemTema[t] = (contagemTema[t] || 0) + 1; });
-    });
-
-    const data = new Date().toISOString().slice(0, 10);
-    const docRef = db.collection('backups').doc(data);
-    await docRef.set({
-      gerado_em: admin.firestore.FieldValue.serverTimestamp(),
-      total: todas.length,
-      correntes: Object.keys(porCorrente).sort(),
-      contagem_por_corrente: Object.fromEntries(Object.entries(porCorrente).map(([k, v]) => [k, v.length])),
-      contagem_por_tema: contagemTema
-    });
-    await Promise.all(Object.entries(porCorrente).map(([corrente, itens]) =>
-      docRef.collection('por_corrente').doc(_slug(corrente)).set({ corrente, citacoes: itens })
-    ));
-
-    // Mantém só os últimos 90 backups (evita crescimento indefinido no plano free do Firestore)
-    const antigos = await db.collection('backups').orderBy('gerado_em', 'desc').offset(90).limit(30).get();
-    await Promise.all(antigos.docs.map(async d => {
-      const subs = await d.ref.collection('por_corrente').get();
-      await Promise.all(subs.docs.map(s => s.ref.delete()));
-      await d.ref.delete();
-    }));
-
-    res.json({ ok: true, data, total: todas.length, correntes: Object.keys(porCorrente).length });
+    res.json(await _gerarBackup());
   } catch (e) {
     console.error('Erro backup-diario:', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// Mesmo backup, disparado pelo site (coordenador logado) em vez do cron —
+// é o que faz o botão "Exportar backup agora" também atualizar a planilha.
+app.post('/backup-agora', auth, async (req, res) => {
+  try {
+    res.json(await _gerarBackup());
+  } catch (e) {
+    console.error('Erro backup-agora:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// E-mail da conta de serviço — é com ele que a planilha precisa ser compartilhada.
+// Não é segredo (é um endereço), mas exige login para não expor a configuração à toa.
+app.get('/conta-servico', auth, (_req, res) => {
+  const cred = _credenciaisServico();
+  if (!cred) return res.status(500).json({ error: 'Credencial de serviço não configurada no servidor.' });
+  res.json({
+    email: cred.client_email,
+    planilha_configurada: !!process.env.GOOGLE_SHEET_ID,
+    sheet_id: process.env.GOOGLE_SHEET_ID || null
+  });
 });
 
 app.get('/health', (_, res) => res.json({ ok: true }));
