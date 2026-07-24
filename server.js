@@ -53,11 +53,22 @@ function _credenciaisServico() {
   try { return JSON.parse(raw); } catch (_) { return null; }
 }
 
+// Aceita o GOOGLE_SHEET_ID colado de qualquer jeito: só o ID, a URL inteira, com barra
+// sobrando no fim, com espaços. Exigir o formato exato só rendia erro difícil de enxergar
+// ("o arquivo que você solicitou não existe") por causa de um caractere invisível.
+function _sheetId() {
+  const bruto = (process.env.GOOGLE_SHEET_ID || '').trim();
+  if (!bruto) return '';
+  const daUrl = bruto.match(/\/d\/([a-zA-Z0-9_-]+)/); // URL completa da planilha
+  if (daUrl) return daUrl[1];
+  return bruto.replace(/^\/+|\/+$/g, '').split(/[/?#]/)[0];
+}
+
 let _sheetsApi = null;
 function _getSheets() {
   if (_sheetsApi) return _sheetsApi;
   const cred = _credenciaisServico();
-  if (!cred || !process.env.GOOGLE_SHEET_ID) return null;
+  if (!cred || !_sheetId()) return null;
   const auth = new google.auth.JWT({
     email: cred.client_email,
     key: cred.private_key,
@@ -105,7 +116,7 @@ async function _garantirAbas(sheets, spreadsheetId, nomes) {
 async function _exportarParaSheets({ citacoes = [], critica = [], autores = [] }) {
   const sheets = _getSheets();
   if (!sheets) return { ok: false, erro: 'Planilha não configurada (falta GOOGLE_SHEET_ID ou credencial).' };
-  const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+  const spreadsheetId = _sheetId();
   const agora = new Date().toISOString().slice(0, 16).replace('T', ' ');
 
   // Uma linha por citação
@@ -643,8 +654,8 @@ app.get('/conta-servico', auth, (_req, res) => {
   if (!cred) return res.status(500).json({ error: 'Credencial de serviço não configurada no servidor.' });
   res.json({
     email: cred.client_email,
-    planilha_configurada: !!process.env.GOOGLE_SHEET_ID,
-    sheet_id: process.env.GOOGLE_SHEET_ID || null
+    planilha_configurada: !!_sheetId(),
+    sheet_id: _sheetId() || null
   });
 });
 
