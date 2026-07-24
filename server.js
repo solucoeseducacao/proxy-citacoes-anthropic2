@@ -1,0 +1,298 @@
+'use strict';
+/* ============================================================================
+ * Proxy da IA de citações — para o site "Grupo de Estudos em Teoria Literária".
+ * Roda de graça no Render. A chave da Anthropic fica AQUI (variável de ambiente),
+ * nunca no navegador. Só o coordenador (felipevigneron@gmail.com) pode chamar —
+ * validado pelo token de login do Firebase.
+ *
+ * Variáveis de ambiente no Render:
+ *   ANTHROPIC_API_KEY   = sk-ant-...        (obrigatória p/ IA)
+ *   ALLOWED_ORIGIN      = https://grupo-de-pesquisa-9e35f.web.app (padrão já aponta p/ ela)
+ *   FIREBASE_PROJECT_ID = grupo-de-pesquisa-9e35f                 (padrão já correto)
+ *   FIREBASE_SERVICE_ACCOUNT_JSON = { ... } (obrigatória p/ backup diário — ver COMO-ATIVAR.md)
+ *   BACKUP_SECRET       = uma senha longa qualquer, só sua (protege o gatilho do backup)
+ * ==========================================================================*/
+
+const express = require('express');
+const cors = require('cors');
+const admin = require('firebase-admin');
+
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'grupo-de-pesquisa-9e35f';
+admin.initializeApp({ projectId: PROJECT_ID }); // verifyIdToken não precisa de service account
+
+// Segunda instância do Admin SDK, COM credenciais, só para o backup escrever no Firestore.
+// (a instância padrão acima, sem credenciais, só serve para validar o token de login)
+let _dbBackup = null;
+function _getDbBackup() {
+  if (_dbBackup) return _dbBackup;
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return null;
+  try {
+    const cred = admin.credential.cert(JSON.parse(raw));
+    const app2 = admin.initializeApp({ credential: cred, projectId: PROJECT_ID }, 'backupApp');
+    _dbBackup = app2.firestore();
+    return _dbBackup;
+  } catch (e) {
+    console.error('FIREBASE_SERVICE_ACCOUNT_JSON inválida:', e.message);
+    return null;
+  }
+}
+
+const FELIPE = 'felipevigneron@gmail.com';
+const KEY = process.env.ANTHROPIC_API_KEY;
+const ALLOWED = (process.env.ALLOWED_ORIGIN || 'https://grupo-de-pesquisa-9e35f.web.app')
+  .split(',').map(s => s.trim());
+
+const app = express();
+app.use(cors({ origin: ALLOWED }));
+app.use(express.json({ limit: '1mb' }));
+
+// Autenticação: exige token do Firebase e e-mail do coordenador
+async function auth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'Sem token' });
+    const decoded = await admin.auth().verifyIdToken(token);
+    if (decoded.email !== FELIPE) return res.status(403).json({ error: 'Apenas o coordenador.' });
+    req.user = decoded;
+    next();
+  } catch (_) {
+    return res.status(401).json({ error: 'Token inválido.' });
+  }
+}
+
+// Rate limit simples em memória: 60 chamadas/hora (protege a chave)
+const hits = [];
+function rate(res) {
+  const agora = Date.now(), hora = 3600000;
+  while (hits.length && hits[0] < agora - hora) hits.shift();
+  if (hits.length >= 60) { res.status(429).json({ error: 'Limite de 60/hora atingido.' }); return false; }
+  hits.push(agora); return true;
+}
+
+// Categorizar / reconhecer uma citação → { comentario, citacao, pagina, relacoes, tema[], corrente }
+app.post('/categorizar', auth, async (req, res) => {
+  if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
+  if (!rate(res)) return;
+  const {
+    texto = '', modelo = 'claude-sonnet-5', esforco = 'medium',
+    formato = 'Comentário - "citação" (página X) - outros comentários ou relações'
+  } = req.body || {};
+  if (!texto || texto.length > 8000) return res.status(400).json({ error: 'Texto inválido.' });
+
+  const sistema =
+    'Você é assistente de um grupo de pesquisa em Teoria Literária brasileira. ' +
+    'Recebe uma anotação em texto livre que segue, aproximadamente, o padrão:\n  ' + formato + '\n' +
+    'Separe os campos com fidelidade ao texto original (não invente conteúdo) e sugira tema(s) e a ' +
+    'corrente crítica mais provável. Se algum campo não existir, deixe vazio.';
+
+  const schema = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      comentario: { type: 'string' }, citacao: { type: 'string' }, pagina: { type: 'string' },
+      relacoes: { type: 'string' }, tema: { type: 'array', items: { type: 'string' } },
+      corrente: { type: 'string' }
+    },
+    required: ['citacao', 'tema', 'corrente']
+  };
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: modelo, max_tokens: 1024,
+        thinking: { type: 'adaptive' },
+        output_config: { effort: esforco, format: { type: 'json_schema', schema } },
+        system: sistema,
+        messages: [{ role: 'user', content: texto }]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json(data);
+    const bloco = (data.content || []).find(b => b.type === 'text');
+    let out = {}; try { out = JSON.parse(bloco ? bloco.text : '{}'); } catch (_) { out = {}; }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Audita UMA citação em busca de problemas objetivos (referência ABNT malformada/incompleta,
+// página ausente, corrente/tema vazios, texto com sinais de corte/erro de transcrição).
+// NUNCA aponta problemas de conteúdo/interpretação — só estrutura/formatação, porque a IA
+// não tem acesso ao texto-fonte original para verificar fidelidade da transcrição.
+// Devolve { tem_problema, problemas:[...], sugestoes: {campo: novoValor, ...} } — só os
+// campos que a IA realmente sugere mudar aparecem em "sugestoes". Propõe, nunca aplica sozinha.
+app.post('/auditar', auth, async (req, res) => {
+  if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
+  if (!rate(res)) return;
+  const {
+    citacao = '', referencia_abnt = '', pagina = '', corrente_critica = '',
+    tema = [], comentario = '', autor_obra = '', obra = '',
+    modelo = 'claude-sonnet-5', esforco = 'medium'
+  } = req.body || {};
+  if (!citacao) return res.status(400).json({ error: 'Citação vazia.' });
+
+  const sistema =
+    'Você revisa citações de um banco de dados acadêmico de teoria literária brasileira. ' +
+    'Aponte SOMENTE problemas objetivos e estruturais: referência ABNT malformada, incompleta ' +
+    'ou com sinais de erro; página ausente ou em formato inválido; corrente crítica ou tema ' +
+    'vazios quando o texto da citação sugere claramente um tema óbvio; texto da citação com ' +
+    'sinais visíveis de corte, corrupção ou erro de OCR/transcrição (ex.: termina no meio de uma ' +
+    'palavra, tem caracteres estranhos repetidos). NÃO invente conteúdo, NÃO avalie o mérito ' +
+    'teórico da citação, NÃO reescreva o texto além de correções óbvias de formatação. Se a ' +
+    'referência ABNT parecer completa e plausível e não houver problema estrutural evidente, ' +
+    'diga que não há problema — na dúvida, não aponte problema algum.';
+
+  const schema = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      tem_problema: { type: 'boolean' },
+      problemas: { type: 'array', items: { type: 'string' } },
+      sugestao_citacao: { type: 'string' },
+      sugestao_referencia_abnt: { type: 'string' },
+      sugestao_pagina: { type: 'string' },
+      sugestao_corrente: { type: 'string' },
+      sugestao_tema: { type: 'array', items: { type: 'string' } },
+      sugestao_comentario: { type: 'string' }
+    },
+    required: ['tem_problema', 'problemas']
+  };
+
+  const contexto = JSON.stringify({
+    citacao, referencia_abnt, pagina, corrente_critica, tema, comentario, autor_obra, obra
+  }, null, 2);
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: modelo, max_tokens: 1024,
+        thinking: { type: 'adaptive' },
+        output_config: { effort: esforco, format: { type: 'json_schema', schema } },
+        system: sistema,
+        messages: [{ role: 'user', content: 'Revise esta citação:\n' + contexto }]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json(data);
+    const bloco = (data.content || []).find(b => b.type === 'text');
+    let out = {}; try { out = JSON.parse(bloco ? bloco.text : '{}'); } catch (_) { out = {}; }
+
+    // Monta "sugestoes" só com os campos que a IA de fato preencheu (não vazios) —
+    // o cliente só oferece para edição/aceite o que veio com conteúdo real.
+    const sugestoes = {};
+    if (out.sugestao_citacao) sugestoes.citacao = out.sugestao_citacao;
+    if (out.sugestao_referencia_abnt) sugestoes.referencia_abnt = out.sugestao_referencia_abnt;
+    if (out.sugestao_pagina) sugestoes.pagina = out.sugestao_pagina;
+    if (out.sugestao_corrente) sugestoes.corrente_critica = out.sugestao_corrente;
+    if (out.sugestao_tema && out.sugestao_tema.length) sugestoes.tema = out.sugestao_tema;
+    if (out.sugestao_comentario) sugestoes.comentario = out.sugestao_comentario;
+
+    res.json({ tem_problema: !!out.tem_problema, problemas: out.problemas || [], sugestoes });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Lista de modelos atuais da Anthropic (para o seletor) — ao vivo, com fallback
+app.get('/modelos', auth, async (req, res) => {
+  const rotulos = {
+    'claude-haiku-4-5': 'Haiku 4.5 (rápido, econômico)',
+    'claude-sonnet-5':  'Sonnet 5 (equilíbrio — padrão)',
+    'claude-opus-4-8':  'Opus 4.8 (máxima precisão)'
+  };
+  const ordem = ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-4-8'];
+  const fallback = () => ordem.map(id => ({ id, nome: rotulos[id] }));
+  if (!KEY) return res.json({ modelos: fallback() });
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/models?limit=100', {
+      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01' }
+    });
+    const data = await r.json();
+    let modelos = (data.data || [])
+      .filter(m => /haiku|sonnet|opus|fable/.test(m.id))
+      .map(m => ({ id: m.id, nome: rotulos[m.id] || m.display_name || m.id }));
+    if (!modelos.length) return res.json({ modelos: fallback() });
+    modelos.sort((a, b) => {
+      const ia = ordem.indexOf(a.id), ib = ordem.indexOf(b.id);
+      if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+      return a.id.localeCompare(b.id);
+    });
+    res.json({ modelos });
+  } catch (_) {
+    res.json({ modelos: fallback() });
+  }
+});
+
+// Slug simples para nome de documento (correntes viram nomes de doc na subcoleção)
+function _slug(s) {
+  return String(s || 'sem-corrente')
+    .toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'sem-corrente';
+}
+
+// Backup diário automático, organizado por corrente crítica (evita limite de 1MB/doc
+// guardando cada corrente numa subcoleção). Disparado por um cron externo grátis
+// (ex.: cron-job.org) — protegido por senha própria (BACKUP_SECRET), não pelo login,
+// porque quem chama não é um navegador logado.
+app.post('/backup-diario', async (req, res) => {
+  const secret = req.headers['x-backup-secret'];
+  if (!process.env.BACKUP_SECRET || secret !== process.env.BACKUP_SECRET) {
+    return res.status(403).json({ error: 'Não autorizado.' });
+  }
+  const db = _getDbBackup();
+  if (!db) return res.status(500).json({ error: 'Backup não configurado (falta FIREBASE_SERVICE_ACCOUNT_JSON).' });
+
+  try {
+    const [soltas, livro] = await Promise.all([
+      db.collection('citacoes').get(),
+      db.collection('citacoes_livro').get()
+    ]);
+    const todas = [
+      ...soltas.docs.map(d => ({ tipo: 'solta', id: d.id, ...d.data() })),
+      ...livro.docs.map(d => ({ tipo: 'livro', id: d.id, ...d.data() }))
+    ];
+
+    const porCorrente = {};   // corrente -> array de citações
+    const contagemTema = {};  // tema -> contagem
+    todas.forEach(c => {
+      const corrente = c.corrente_critica || 'Sem corrente';
+      (porCorrente[corrente] = porCorrente[corrente] || []).push(c);
+      (c.tema || []).forEach(t => { if (t) contagemTema[t] = (contagemTema[t] || 0) + 1; });
+    });
+
+    const data = new Date().toISOString().slice(0, 10);
+    const docRef = db.collection('backups').doc(data);
+    await docRef.set({
+      gerado_em: admin.firestore.FieldValue.serverTimestamp(),
+      total: todas.length,
+      correntes: Object.keys(porCorrente).sort(),
+      contagem_por_corrente: Object.fromEntries(Object.entries(porCorrente).map(([k, v]) => [k, v.length])),
+      contagem_por_tema: contagemTema
+    });
+    await Promise.all(Object.entries(porCorrente).map(([corrente, itens]) =>
+      docRef.collection('por_corrente').doc(_slug(corrente)).set({ corrente, citacoes: itens })
+    ));
+
+    // Mantém só os últimos 90 backups (evita crescimento indefinido no plano free do Firestore)
+    const antigos = await db.collection('backups').orderBy('gerado_em', 'desc').offset(90).limit(30).get();
+    await Promise.all(antigos.docs.map(async d => {
+      const subs = await d.ref.collection('por_corrente').get();
+      await Promise.all(subs.docs.map(s => s.ref.delete()));
+      await d.ref.delete();
+    }));
+
+    res.json({ ok: true, data, total: todas.length, correntes: Object.keys(porCorrente).length });
+  } catch (e) {
+    console.error('Erro backup-diario:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/health', (_, res) => res.json({ ok: true }));
+
+app.listen(process.env.PORT || 3000, () => console.log('Proxy de citações rodando'));
