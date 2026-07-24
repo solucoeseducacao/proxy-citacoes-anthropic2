@@ -81,11 +81,27 @@ app.post('/categorizar', auth, async (req, res) => {
   } = req.body || {};
   if (!texto || texto.length > 8000) return res.status(400).json({ error: 'Texto inválido.' });
 
+  const CORRENTES_REFERENCIA = [
+    'Formalismo Russo', 'Estruturalismo', 'New Criticism (Nova Crítica)',
+    'Crítica Marxista / Sociológica', 'Crítica Psicanalítica', 'Pós-estruturalismo / Desconstrução',
+    'Estética da Recepção', 'Hermenêutica e Fenomenologia', 'Narratologia', 'Estudos Culturais',
+    'Estudos Pós-coloniais', 'Crítica Feminista e Teoria Queer', 'Teoria Crítica (Escola de Frankfurt)',
+    'Semiótica', 'Crítica Literária Brasileira'
+  ].join(', ');
+
   const sistema =
     'Você é assistente de um grupo de pesquisa em Teoria Literária brasileira. ' +
     'Recebe uma anotação em texto livre que segue, aproximadamente, o padrão:\n  ' + formato + '\n' +
-    'Separe os campos com fidelidade ao texto original (não invente conteúdo) e sugira tema(s) e a ' +
-    'corrente crítica mais provável. Se algum campo não existir, deixe vazio.';
+    'Separe os campos com fidelidade ao texto original (não invente conteúdo).\n\n' +
+    'Para "tema" e "corrente": baseie-se ESTRITAMENTE no que o texto da citação e do comentário ' +
+    'efetivamente argumentam — nunca na reputação geral do autor da obra ou em associações que você ' +
+    'conheça sobre ele por outras fontes. Um autor pode escrever a partir de correntes diferentes ao ' +
+    'longo da carreira, ou até citar/comentar uma corrente sem praticá-la; um crítico famoso por uma ' +
+    'escola pode, num trecho específico, não estar fazendo esse tipo de análise. É preferível deixar ' +
+    '"corrente" vazio a arriscar um palpite não sustentado pelo texto em mãos.\n' +
+    'Correntes de referência mais comuns neste grupo (use uma delas quando fizer sentido; use outra ' +
+    'apenas se o texto claramente indicar uma corrente fora desta lista): ' + CORRENTES_REFERENCIA + '.\n' +
+    'Se algum campo não existir ou não puder ser determinado com segurança, deixe-o vazio.';
 
   const schema = {
     type: 'object', additionalProperties: false,
