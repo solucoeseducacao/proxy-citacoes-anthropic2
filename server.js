@@ -565,6 +565,77 @@ app.post('/migrar-comentarios', auth, async (req, res) => {
   }
 });
 
+/* Repõe comentários pessoais a partir de `backups/{data}/comentarios_privados/{uid}`.
+ *
+ * Roda no servidor por dois motivos: (1) aquela subcoleção tem rule `read: if false` —
+ * nem o coordenador lê pelo site; (2) ninguém pode escrever no espaço privado de outra
+ * pessoa. O Admin SDK move o texto de um lado para o outro **sem devolvê-lo na resposta**:
+ * o coordenador consegue recuperar o comentário de um pesquisador sem jamais lê-lo.
+ *
+ * Aditivo por padrão: repõe só o que está faltando. `sobrescrever: true` troca o atual pelo
+ * do backup (descarta o que a pessoa escreveu depois). `?simular=1` não grava nada. */
+app.post('/restaurar-privados', auth, async (req, res) => {
+  const db = _getDbBackup();
+  if (!db) return res.status(500).json({ error: 'Falta FIREBASE_SERVICE_ACCOUNT_JSON no servidor.' });
+  const { data = '', email = '', sobrescrever = false } = req.body || {};
+  const simular = req.query.simular === '1';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+    return res.status(400).json({ error: 'Informe a data do backup no formato AAAA-MM-DD.' });
+  }
+
+  try {
+    // Opcional: restaurar de uma pessoa só. Recebe e-mail (que o coordenador conhece)
+    // e converte para uid internamente.
+    let uidAlvo = null;
+    if (email) {
+      const u = await db.collection('usuarios').where('email', '==', String(email).trim().toLowerCase()).limit(1).get();
+      if (u.empty) return res.status(404).json({ error: 'Nenhum usuário cadastrado com esse e-mail.' });
+      uidAlvo = u.docs[0].id;
+    }
+
+    const snap = await db.collection('backups').doc(data).collection('comentarios_privados').get();
+    if (snap.empty) {
+      return res.json({ ok: true, simulacao: simular, aviso: 'Este backup não guardou comentários pessoais (provavelmente é anterior a essa mudança).', restaurados: 0 });
+    }
+
+    let restaurados = 0, jaExistiam = 0, citacaoSumiu = 0, pessoas = 0;
+    for (const doc of snap.docs) {
+      const uid = doc.id;
+      if (uidAlvo && uid !== uidAlvo) continue;
+      pessoas++;
+      const itens = (doc.data() || {}).itens || [];
+      for (const it of itens) {
+        const citacaoId = it && it.citacaoId;
+        const comentario = ((it && it.comentario) || '').trim();
+        if (!citacaoId || !comentario) continue;
+
+        const citRef = db.collection('citacoes').doc(citacaoId);
+        const cit = await citRef.get();
+        // Comentário órfão: a citação em si não existe mais. Restaure a citação primeiro
+        // (pelo painel do site) e rode isto de novo.
+        if (!cit.exists) { citacaoSumiu++; continue; }
+
+        const alvo = citRef.collection('privado').doc(uid);
+        if (!sobrescrever && (await alvo.get()).exists) { jaExistiam++; continue; }
+        if (!simular) {
+          await alvo.set({
+            comentario, uid,
+            atualizado_em: admin.firestore.FieldValue.serverTimestamp(),
+            restaurado_de: data
+          });
+        }
+        restaurados++;
+      }
+    }
+
+    // Só números — o texto dos comentários nunca sai daqui.
+    res.json({ ok: true, simulacao: simular, sobrescrever: !!sobrescrever, pessoas, restaurados, ja_existiam: jaExistiam, citacao_inexistente: citacaoSumiu });
+  } catch (e) {
+    console.error('Erro restaurar-privados:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // E-mail da conta de serviço — é com ele que a planilha precisa ser compartilhada.
 // Não é segredo (é um endereço), mas exige login para não expor a configuração à toa.
 app.get('/conta-servico', auth, (_req, res) => {
