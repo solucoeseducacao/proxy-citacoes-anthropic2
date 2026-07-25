@@ -15,6 +15,7 @@
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
 const { google } = require('googleapis');
 
@@ -227,37 +228,149 @@ function rate(res) {
   hits.push(agora); return true;
 }
 
+// Só modelos conhecidos podem ser pedidos. O cliente manda o `modelo` escolhido no seletor,
+// e um valor arbitrário vindo dali chegaria direto à Anthropic — restringir a esta lista
+// evita chamar (e pagar por) um modelo não previsto caso o campo seja adulterado.
+const MODELOS_PERMITIDOS = new Set([
+  'claude-haiku-4-5', 'claude-sonnet-5', 'claude-sonnet-4-6',
+  'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-fable-5'
+]);
+const ESFORCOS_PERMITIDOS = new Set(['low', 'medium', 'high']);
+function modeloValido(m) { return MODELOS_PERMITIDOS.has(m) ? m : 'claude-sonnet-5'; }
+function esforcoValido(e) { return ESFORCOS_PERMITIDOS.has(e) ? e : 'medium'; }
+
+// Comparação de segredo em tempo constante: com `!==`, o tempo de resposta varia conforme
+// quantos caracteres iniciais batem, o que em tese permite descobrir o segredo por tentativa
+// e medição. `timingSafeEqual` sempre leva o mesmo tempo.
+function segredoConfere(recebido, esperado) {
+  if (!esperado || typeof recebido !== 'string') return false;
+  const a = Buffer.from(recebido), b = Buffer.from(esperado);
+  if (a.length !== b.length) return false; // timingSafeEqual exige mesmo tamanho
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Instruções de tema/corrente — as MESMAS para chamada única e em lote, para que agrupar
+// não mude o critério de classificação (economia de token não pode custar qualidade).
+const CORRENTES_REFERENCIA = [
+  'Formalismo Russo', 'Estruturalismo', 'New Criticism (Nova Crítica)',
+  'Crítica Marxista / Sociológica', 'Crítica Psicanalítica', 'Pós-estruturalismo / Desconstrução',
+  'Estética da Recepção', 'Hermenêutica e Fenomenologia', 'Narratologia', 'Estudos Culturais',
+  'Estudos Pós-coloniais', 'Crítica Feminista e Teoria Queer', 'Teoria Crítica (Escola de Frankfurt)',
+  'Semiótica', 'Crítica Literária Brasileira'
+].join(', ');
+
+const REGRA_TEMA_CORRENTE =
+  'Para "tema" e "corrente": baseie-se ESTRITAMENTE no que o texto da citação e do comentário ' +
+  'efetivamente argumentam — nunca na reputação geral do autor da obra ou em associações que você ' +
+  'conheça sobre ele por outras fontes. Um autor pode escrever a partir de correntes diferentes ao ' +
+  'longo da carreira, ou até citar/comentar uma corrente sem praticá-la; um crítico famoso por uma ' +
+  'escola pode, num trecho específico, não estar fazendo esse tipo de análise. É preferível deixar ' +
+  '"corrente" vazio a arriscar um palpite não sustentado pelo texto em mãos.\n' +
+  'Correntes de referência mais comuns neste grupo (use uma delas quando fizer sentido; use outra ' +
+  'apenas se o texto claramente indicar uma corrente fora desta lista): ' + CORRENTES_REFERENCIA + '.\n' +
+  'Se algum campo não existir ou não puder ser determinado com segurança, deixe-o vazio.';
+
+/* Categoriza VÁRIAS citações numa única chamada.
+ *
+ * Motivo (economia real, medida): o prompt de sistema tem ~170 tokens e era reenviado uma vez
+ * POR CITAÇÃO. Com 9 citações, isso é o mesmo texto mandado 9 vezes. Aqui vai uma vez só, e as
+ * citações entram numeradas na mensagem — o custo por citação cai para o próprio texto dela.
+ * Ganho maior ainda: consome 1 unidade do limite de 60/hora em vez de N, que era o gargalo real
+ * ao categorizar muitas citações de uma vez.
+ *
+ * A qualidade é preservada porque as instruções são idênticas às da chamada única e cada citação
+ * é avaliada individualmente dentro do lote — o schema obriga a devolver o `indice` de cada uma,
+ * e o cliente confere se voltou tudo (sem casar por posição, que sairia errado se faltar item).
+ */
+app.post('/categorizar-lote', auth, async (req, res) => {
+  if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
+  if (!rate(res)) return;
+  const { textos = [] } = req.body || {};
+  const modelo = modeloValido((req.body || {}).modelo);
+  const esforco = esforcoValido((req.body || {}).esforco);
+
+  if (!Array.isArray(textos) || !textos.length) return res.status(400).json({ error: 'Envie "textos" como lista não vazia.' });
+  if (textos.length > 25) return res.status(400).json({ error: 'Máximo de 25 citações por lote.' });
+  const limpos = textos.map(t => String(t || '').trim()).filter(Boolean);
+  if (!limpos.length) return res.status(400).json({ error: 'Todos os textos vieram vazios.' });
+  const total = limpos.reduce((s, t) => s + t.length, 0);
+  if (total > 60000) return res.status(400).json({ error: 'Lote grande demais; divida em partes menores.' });
+
+  const sistema =
+    'Você é assistente de um grupo de pesquisa em Teoria Literária brasileira. ' +
+    'Recebe VÁRIAS citações numeradas e classifica CADA UMA independentemente das outras — ' +
+    'não deixe a classificação de uma influenciar a das demais.\n\n' + REGRA_TEMA_CORRENTE + '\n' +
+    'Devolva exatamente um resultado por citação recebida, repetindo o número (indice) de cada uma.';
+
+  const schema = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      resultados: {
+        type: 'array',
+        items: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            indice: { type: 'integer' },
+            tema: { type: 'array', items: { type: 'string' } },
+            corrente: { type: 'string' }
+          },
+          required: ['indice', 'tema', 'corrente']
+        }
+      }
+    },
+    required: ['resultados']
+  };
+
+  const conteudo = limpos.map((t, i) => `[${i}] ${t}`).join('\n\n---\n\n');
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: modelo, max_tokens: Math.min(400 + limpos.length * 150, 8000),
+        thinking: { type: 'adaptive' },
+        output_config: { effort: esforco, format: { type: 'json_schema', schema } },
+        system: sistema,
+        messages: [{ role: 'user', content: 'Classifique cada citação:\n\n' + conteudo }]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json(data);
+    const bloco = (data.content || []).find(b => b.type === 'text');
+    let out = {}; try { out = JSON.parse(bloco ? bloco.text : '{}'); } catch (_) { out = {}; }
+
+    // Devolve indexado por posição, preenchendo com vazio o que não voltou — assim o cliente
+    // nunca associa a resposta de uma citação a outra por engano.
+    const porIndice = new Map((out.resultados || []).map(x => [x.indice, x]));
+    const resultados = limpos.map((_, i) => {
+      const achado = porIndice.get(i);
+      return achado ? { tema: achado.tema || [], corrente: achado.corrente || '' } : null;
+    });
+    res.json({ resultados, uso: data.usage || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Categorizar / reconhecer uma citação → { comentario, citacao, pagina, relacoes, tema[], corrente }
 app.post('/categorizar', auth, async (req, res) => {
   if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
   if (!rate(res)) return;
   const {
-    texto = '', modelo = 'claude-sonnet-5', esforco = 'medium',
+    texto = '',
     formato = 'Comentário - "citação" (página X) - outros comentários ou relações'
   } = req.body || {};
+  const modelo = modeloValido((req.body || {}).modelo);
+  const esforco = esforcoValido((req.body || {}).esforco);
   if (!texto || texto.length > 8000) return res.status(400).json({ error: 'Texto inválido.' });
 
-  const CORRENTES_REFERENCIA = [
-    'Formalismo Russo', 'Estruturalismo', 'New Criticism (Nova Crítica)',
-    'Crítica Marxista / Sociológica', 'Crítica Psicanalítica', 'Pós-estruturalismo / Desconstrução',
-    'Estética da Recepção', 'Hermenêutica e Fenomenologia', 'Narratologia', 'Estudos Culturais',
-    'Estudos Pós-coloniais', 'Crítica Feminista e Teoria Queer', 'Teoria Crítica (Escola de Frankfurt)',
-    'Semiótica', 'Crítica Literária Brasileira'
-  ].join(', ');
-
+  // Mesmas regras de tema/corrente do endpoint em lote (constante compartilhada acima):
+  // se divergissem, a classificação mudaria conforme o caminho usado.
   const sistema =
     'Você é assistente de um grupo de pesquisa em Teoria Literária brasileira. ' +
     'Recebe uma anotação em texto livre que segue, aproximadamente, o padrão:\n  ' + formato + '\n' +
-    'Separe os campos com fidelidade ao texto original (não invente conteúdo).\n\n' +
-    'Para "tema" e "corrente": baseie-se ESTRITAMENTE no que o texto da citação e do comentário ' +
-    'efetivamente argumentam — nunca na reputação geral do autor da obra ou em associações que você ' +
-    'conheça sobre ele por outras fontes. Um autor pode escrever a partir de correntes diferentes ao ' +
-    'longo da carreira, ou até citar/comentar uma corrente sem praticá-la; um crítico famoso por uma ' +
-    'escola pode, num trecho específico, não estar fazendo esse tipo de análise. É preferível deixar ' +
-    '"corrente" vazio a arriscar um palpite não sustentado pelo texto em mãos.\n' +
-    'Correntes de referência mais comuns neste grupo (use uma delas quando fizer sentido; use outra ' +
-    'apenas se o texto claramente indicar uma corrente fora desta lista): ' + CORRENTES_REFERENCIA + '.\n' +
-    'Se algum campo não existir ou não puder ser determinado com segurança, deixe-o vazio.';
+    'Separe os campos com fidelidade ao texto original (não invente conteúdo).\n\n' + REGRA_TEMA_CORRENTE;
 
   const schema = {
     type: 'object', additionalProperties: false,
@@ -302,9 +415,10 @@ app.post('/auditar', auth, async (req, res) => {
   if (!rate(res)) return;
   const {
     citacao = '', referencia_abnt = '', pagina = '', corrente_critica = '',
-    tema = [], comentario = '', autor_obra = '', obra = '',
-    modelo = 'claude-sonnet-5', esforco = 'medium'
+    tema = [], comentario = '', autor_obra = '', obra = ''
   } = req.body || {};
+  const modelo = modeloValido((req.body || {}).modelo);
+  const esforco = esforcoValido((req.body || {}).esforco);
   if (!citacao) return res.status(400).json({ error: 'Citação vazia.' });
 
   const sistema =
@@ -504,7 +618,7 @@ async function _gerarBackup() {
 
 app.post('/backup-diario', async (req, res) => {
   const secret = req.headers['x-backup-secret'];
-  if (!process.env.BACKUP_SECRET || secret !== process.env.BACKUP_SECRET) {
+  if (!segredoConfere(secret, process.env.BACKUP_SECRET)) {
     return res.status(403).json({ error: 'Não autorizado.' });
   }
   try {
