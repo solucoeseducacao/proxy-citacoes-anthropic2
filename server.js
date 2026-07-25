@@ -267,8 +267,29 @@ const REGRA_TEMA_CORRENTE =
   'escola pode, num trecho específico, não estar fazendo esse tipo de análise. É preferível deixar ' +
   '"corrente" vazio a arriscar um palpite não sustentado pelo texto em mãos.\n' +
   'Correntes de referência mais comuns neste grupo (use uma delas quando fizer sentido; use outra ' +
-  'apenas se o texto claramente indicar uma corrente fora desta lista): ' + CORRENTES_REFERENCIA + '.\n' +
+  'apenas se o texto claramente indicar uma corrente fora desta lista): ' + CORRENTES_REFERENCIA + '.\n\n' +
+  'SOBRE OS TEMAS — o objetivo é AGRUPAR citações, não descrever cada uma:\n' +
+  '- Prefira SEMPRE reaproveitar um tema já existente na lista de temas em uso (enviada abaixo, ' +
+  'quando houver) a criar um novo. Reutilizar é o comportamento desejado, inclusive repetindo o ' +
+  'mesmo tema em muitas citações: é assim que elas se agrupam e ficam encontráveis pelo filtro.\n' +
+  '- Seja SINTÉTICO: 1 a 3 temas por citação, curtos e amplos o bastante para servir a várias ' +
+  'citações diferentes. Um tema que só se aplica a uma citação não serve para agrupar nada.\n' +
+  '- Evite variações do mesmo conceito (singular/plural, sinônimos, versões mais longas do mesmo ' +
+  'termo). Se um tema em uso já cobre a ideia, use exatamente ele, com a mesma grafia.\n' +
+  '- Só invente um tema novo quando nenhum dos existentes servir — e, nesse caso, escolha um termo ' +
+  'genérico o bastante para que futuras citações também possam usá-lo.\n' +
   'Se algum campo não existir ou não puder ser determinado com segurança, deixe-o vazio.';
+
+// Monta o bloco com os temas já em uso, para a IA reaproveitar em vez de inventar.
+// Limitado aos mais frequentes: a lista inteira cresceria sem limite e encareceria cada
+// chamada — e são justamente os mais usados que devem servir de vocabulário comum.
+function _blocoTemasEmUso(temas) {
+  if (!Array.isArray(temas) || !temas.length) return '';
+  const limpos = [...new Set(temas.map(t => String(t || '').trim()).filter(Boolean))].slice(0, 60);
+  if (!limpos.length) return '';
+  return '\n\nTEMAS JÁ EM USO NESTE GRUPO (reaproveite estes sempre que couber, com a grafia exata):\n' +
+    limpos.join(' · ');
+}
 
 /* Categoriza VÁRIAS citações numa única chamada.
  *
@@ -285,7 +306,7 @@ const REGRA_TEMA_CORRENTE =
 app.post('/categorizar-lote', auth, async (req, res) => {
   if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
   if (!rate(res)) return;
-  const { textos = [] } = req.body || {};
+  const { textos = [], temas_em_uso = [] } = req.body || {};
   const modelo = modeloValido((req.body || {}).modelo);
   const esforco = esforcoValido((req.body || {}).esforco);
 
@@ -299,7 +320,8 @@ app.post('/categorizar-lote', auth, async (req, res) => {
   const sistema =
     'Você é assistente de um grupo de pesquisa em Teoria Literária brasileira. ' +
     'Recebe VÁRIAS citações numeradas e classifica CADA UMA independentemente das outras — ' +
-    'não deixe a classificação de uma influenciar a das demais.\n\n' + REGRA_TEMA_CORRENTE + '\n' +
+    'não deixe a classificação de uma influenciar a das demais.\n\n' + REGRA_TEMA_CORRENTE +
+    _blocoTemasEmUso(temas_em_uso) + '\n' +
     'Devolva exatamente um resultado por citação recebida, repetindo o número (indice) de cada uma.';
 
   const schema = {
@@ -358,7 +380,7 @@ app.post('/categorizar', auth, async (req, res) => {
   if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
   if (!rate(res)) return;
   const {
-    texto = '',
+    texto = '', temas_em_uso = [],
     formato = 'Comentário - "citação" (página X) - outros comentários ou relações'
   } = req.body || {};
   const modelo = modeloValido((req.body || {}).modelo);
@@ -370,7 +392,8 @@ app.post('/categorizar', auth, async (req, res) => {
   const sistema =
     'Você é assistente de um grupo de pesquisa em Teoria Literária brasileira. ' +
     'Recebe uma anotação em texto livre que segue, aproximadamente, o padrão:\n  ' + formato + '\n' +
-    'Separe os campos com fidelidade ao texto original (não invente conteúdo).\n\n' + REGRA_TEMA_CORRENTE;
+    'Separe os campos com fidelidade ao texto original (não invente conteúdo).\n\n' + REGRA_TEMA_CORRENTE +
+    _blocoTemasEmUso(temas_em_uso);
 
   const schema = {
     type: 'object', additionalProperties: false,
