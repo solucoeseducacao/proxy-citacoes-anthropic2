@@ -88,6 +88,19 @@ const COLUNAS_SHEET = [
   'atualizado_por', 'atualizado_em'
 ];
 
+// Alguns campos guardam marcação HTML (ex.: fontes com <em>Título</em>), que o site
+// renderiza mas a planilha mostraria literalmente. Aqui é ESPELHO DE LEITURA, então o
+// texto sai limpo. O JSON de backup continua com a marcação intacta — lá é fidelidade
+// para restaurar, e é ele que devolve os dados ao site.
+function _semHtml(v) {
+  return String(v ?? '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ').trim();
+}
+
 // Timestamp do Firestore (ou string/Date) → texto legível AAAA-MM-DD HH:MM
 function _dataLegivel(v) {
   if (!v) return '';
@@ -121,10 +134,10 @@ async function _exportarParaSheets({ citacoes = [], critica = [], autores = [] }
 
   // Uma linha por citação
   const linhasCitacoes = citacoes.map(c => [
-    c.tipo || '', c.id || '', c.citacao || '', c.pagina || '', c.autor_obra || '',
-    c.obra || '', c.corrente_critica || '', (c.tema || []).join('; '), c.comentario || '',
-    c.referencia_abnt || '', c.pesquisador || '', _dataLegivel(c.data_insercao),
-    c.atualizado_por || '', _dataLegivel(c.atualizado_em)
+    c.tipo || '', c.id || '', _semHtml(c.citacao), _semHtml(c.pagina), _semHtml(c.autor_obra),
+    _semHtml(c.obra), _semHtml(c.corrente_critica), (c.tema || []).map(_semHtml).join('; '),
+    _semHtml(c.comentario), _semHtml(c.referencia_abnt), _semHtml(c.pesquisador),
+    _dataLegivel(c.data_insercao), c.atualizado_por || '', _dataLegivel(c.atualizado_em)
   ]);
 
   // Crítica Literária guarda `conceitos` como lista de objetos aninhados; a planilha é plana,
@@ -134,18 +147,18 @@ async function _exportarParaSheets({ citacoes = [], critica = [], autores = [] }
   critica.forEach(c => {
     const conceitos = Array.isArray(c.conceitos) && c.conceitos.length ? c.conceitos : [null];
     conceitos.forEach(k => linhasCritica.push([
-      c.id || '', c.corrente || '', c.periodo || '', c.ordem ?? '',
-      k ? (k.conceito || '') : '', k ? (k.definicao || '') : '',
-      k ? (k.exemplo || '') : '', k ? (k.fonte || '') : '',
+      c.id || '', _semHtml(c.corrente), _semHtml(c.periodo), c.ordem ?? '',
+      k ? _semHtml(k.conceito) : '', k ? _semHtml(k.definicao) : '',
+      k ? _semHtml(k.exemplo) : '', k ? _semHtml(k.fonte) : '',
       c.atualizadoPor || '', _dataLegivel(c.atualizadoEm)
     ]));
   });
 
   // `correntes` é uma lista (um autor pode transitar por várias) — vira texto separado por ";"
   const linhasAutores = autores.map(a => [
-    a.id || '', a.autor || '',
-    Array.isArray(a.correntes) ? a.correntes.join('; ') : (a.correntes || ''),
-    a.contribuicoes || ''
+    a.id || '', _semHtml(a.autor),
+    Array.isArray(a.correntes) ? a.correntes.map(_semHtml).join('; ') : _semHtml(a.correntes),
+    _semHtml(a.contribuicoes)
   ]);
 
   const blocos = [
