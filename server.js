@@ -585,6 +585,30 @@ async function _gerarBackup() {
     console.error('Não foi possível ler os comentários pessoais:', e.message);
   }
 
+  // Anotações de trabalho (coleção `anotacoes`). Mesmo tratamento dos comentários
+  // pessoais, e pelo mesmo motivo: a anotação nasce privada, então guardá-la num lugar
+  // que o site deixasse ler abriria pela porta do backup o que a regra fecha na origem.
+  // Vão agrupadas por dono, numa subcoleção com `read, write: if false` — nem o
+  // coordenador lê pelo site; quem restaura é o servidor, que devolve só números.
+  // As compartilhadas seguem junto: separá-las renderia pouco e o caminho de restauração
+  // teria de existir dos dois jeitos de qualquer forma.
+  const anotacoesPorDono = {};
+  let anotacoesTotal = 0, anotacoesCompartilhadas = 0;
+  try {
+    const anots = await db.collection('anotacoes').get();
+    anots.docs.forEach(d => {
+      const a = d.data() || {};
+      const uid = a.autor_uid;
+      if (!uid) return; // sem dono não há para quem restaurar
+      (anotacoesPorDono[uid] = anotacoesPorDono[uid] || []).push({ id: d.id, ...a });
+      anotacoesTotal++;
+      if (a.compartilhada === true) anotacoesCompartilhadas++;
+    });
+  } catch (e) {
+    // Igual aos comentários: perder o backup inteiro por causa desta coleção seria pior.
+    console.error('Não foi possível ler as anotações:', e.message);
+  }
+
   const porCorrente = {};   // corrente -> array de citações
   const contagemTema = {};  // tema -> contagem
   todas.forEach(c => {
@@ -601,7 +625,15 @@ async function _gerarBackup() {
     correntes: Object.keys(porCorrente).sort(),
     contagem_por_corrente: Object.fromEntries(Object.entries(porCorrente).map(([k, v]) => [k, v.length])),
     contagem_por_tema: contagemTema,
-    contagem_outras: Object.fromEntries(Object.entries(outras).map(([k, v]) => [k, v.length]))
+    contagem_outras: Object.fromEntries(Object.entries(outras).map(([k, v]) => [k, v.length])),
+    // Só números: deixa o coordenador conferir que as anotações foram copiadas sem que
+    // isso lhe dê acesso ao conteúdo de nenhuma delas.
+    contagem_anotacoes: {
+      total: anotacoesTotal,
+      compartilhadas: anotacoesCompartilhadas,
+      privadas: anotacoesTotal - anotacoesCompartilhadas,
+      pessoas: Object.keys(anotacoesPorDono).length
+    }
   });
   await Promise.all(Object.entries(porCorrente).map(([corrente, itens]) =>
     docRef.collection('por_corrente').doc(_slug(corrente)).set({ corrente, citacoes: itens })
@@ -612,13 +644,16 @@ async function _gerarBackup() {
   await Promise.all(Object.entries(privadosPorDono).map(([uid, itens]) =>
     docRef.collection('comentarios_privados').doc(uid).set({ uid, itens })
   ));
+  await Promise.all(Object.entries(anotacoesPorDono).map(([uid, itens]) =>
+    docRef.collection('anotacoes').doc(uid).set({ uid, itens })
+  ));
 
   // Mantém só os últimos 90 backups (evita crescimento indefinido no plano free do Firestore)
   const antigos = await db.collection('backups').orderBy('gerado_em', 'desc').offset(90).limit(30).get();
   await Promise.all(antigos.docs.map(async d => {
     // Apagar TODAS as subcoleções — no Firestore, apagar o documento pai não apaga as filhas;
     // esquecer alguma aqui deixaria lixo órfão acumulando para sempre.
-    for (const sub of ['por_corrente', 'outras_colecoes', 'comentarios_privados']) {
+    for (const sub of ['por_corrente', 'outras_colecoes', 'comentarios_privados', 'anotacoes']) {
       const subs = await d.ref.collection(sub).get();
       await Promise.all(subs.docs.map(s => s.ref.delete()));
     }
@@ -635,6 +670,9 @@ async function _gerarBackup() {
   return {
     ok: true, data, total: todas.length, correntes: Object.keys(porCorrente).length,
     outras: Object.fromEntries(Object.entries(outras).map(([k, v]) => [k, v.length])),
+    // Anotações não vão para a planilha (é um espelho legível, e a maioria delas é privada);
+    // ficam só no backup do Firestore, de onde o servidor sabe restaurá-las.
+    anotacoes: { total: anotacoesTotal, pessoas: Object.keys(anotacoesPorDono).length },
     planilha
   };
 }
@@ -793,6 +831,72 @@ app.post('/restaurar-privados', auth, async (req, res) => {
     res.json({ ok: true, simulacao: simular, sobrescrever: !!sobrescrever, pessoas, restaurados, ja_existiam: jaExistiam, citacao_inexistente: citacaoSumiu });
   } catch (e) {
     console.error('Erro restaurar-privados:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* Restaura anotações de trabalho a partir de um backup.
+ *
+ * Tem de ser no servidor pelo mesmo motivo dos comentários pessoais: pela regra do
+ * Firestore, `anotacoes` só aceita gravação de quem é o autor — o coordenador não
+ * consegue (nem deve) recriar a anotação de outra pessoa pelo navegador. O Admin SDK
+ * ignora as rules, então é o único caminho; e a resposta devolve SÓ números, para
+ * recuperar o material de alguém sem lê-lo.
+ *
+ * Aditivo por padrão: só recria o que está faltando. `sobrescrever` é escolha explícita.
+ * `?simular=1` faz passagem seca. `email` restringe a uma pessoa. Idempotente.
+ * O dono original é preservado (`autor_uid` vem do backup, nunca de quem chamou) — é o
+ * que impede a restauração de transferir a autoria da anotação para o coordenador. */
+app.post('/restaurar-anotacoes', auth, async (req, res) => {
+  const db = _getDbBackup();
+  if (!db) return res.status(500).json({ error: 'Falta FIREBASE_SERVICE_ACCOUNT_JSON no servidor.' });
+  const { data = '', email = '', sobrescrever = false } = req.body || {};
+  const simular = req.query.simular === '1';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+    return res.status(400).json({ error: 'Informe a data do backup no formato AAAA-MM-DD.' });
+  }
+
+  try {
+    let uidAlvo = null;
+    if (email) {
+      const u = await db.collection('usuarios').where('email', '==', String(email).trim().toLowerCase()).limit(1).get();
+      if (u.empty) return res.status(404).json({ error: 'Nenhum usuário cadastrado com esse e-mail.' });
+      uidAlvo = u.docs[0].id;
+    }
+
+    const snap = await db.collection('backups').doc(data).collection('anotacoes').get();
+    if (snap.empty) {
+      return res.json({
+        ok: true, simulacao: simular, restaurados: 0,
+        aviso: 'Este backup não guardou anotações (provavelmente é anterior a essa mudança, ou não havia nenhuma).'
+      });
+    }
+
+    let restaurados = 0, jaExistiam = 0, semId = 0, pessoas = 0;
+    for (const doc of snap.docs) {
+      const uid = doc.id;
+      if (uidAlvo && uid !== uidAlvo) continue;
+      pessoas++;
+      const itens = (doc.data() || {}).itens || [];
+      for (const it of itens) {
+        const id = it && it.id;
+        if (!id) { semId++; continue; }
+
+        const alvo = db.collection('anotacoes').doc(id);
+        if (!sobrescrever && (await alvo.get()).exists) { jaExistiam++; continue; }
+        if (!simular) {
+          const dados = { ...it, autor_uid: uid, restaurado_de: data };
+          delete dados.id; // o id é a chave do documento, não um campo dentro dele
+          await alvo.set(dados);
+        }
+        restaurados++;
+      }
+    }
+
+    // Só números — o texto das anotações nunca sai daqui.
+    res.json({ ok: true, simulacao: simular, sobrescrever: !!sobrescrever, pessoas, restaurados, ja_existiam: jaExistiam, sem_id: semId });
+  } catch (e) {
+    console.error('Erro restaurar-anotacoes:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
