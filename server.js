@@ -102,6 +102,22 @@ function _semHtml(v) {
     .replace(/\s+/g, ' ').trim();
 }
 
+/* Neutraliza injeção de fórmula na planilha.
+ *
+ * Precisão sobre o risco, porque muda o que precisa ser feito: a escrita aqui usa
+ * `valueInputOption: 'RAW'`, e RAW guarda o texto como texto — o Google Sheets NÃO
+ * interpreta `=IMPORTDATA(...)` como fórmula por esse caminho. O buraco não é a planilha
+ * em si: é o dia em que alguém EXPORTA essa planilha para .csv/.xlsx e abre no Excel ou
+ * no LibreOffice, que interpretam a célula na abertura. Aí a fórmula roda na máquina de
+ * quem abriu, com os privilégios daquela pessoa.
+ *
+ * O prefixo com apóstrofo custa três linhas e fecha esse caminho na origem, para qualquer
+ * programa que venha a ler a planilha depois. O apóstrofo não aparece na célula. */
+function _sanitizarCelula(v) {
+  const s = String(v ?? '');
+  return /^[=+\-@|\t\r]/.test(s) ? "'" + s : s;
+}
+
 // Timestamp do Firestore (ou string/Date) → texto legível AAAA-MM-DD HH:MM
 function _dataLegivel(v) {
   if (!v) return '';
@@ -176,16 +192,26 @@ async function _exportarParaSheets({ citacoes = [], critica = [], autores = [] }
     await _garantirAbas(sheets, spreadsheetId, blocos.map(b => b.aba));
     for (const b of blocos) {
       const faixa = `'${b.aba}'`;
-      await sheets.spreadsheets.values.clear({ spreadsheetId, range: `${faixa}!A:Z` });
+      const valores = [
+        [`Atualizado em ${agora} UTC — ${b.linhas.length} ${b.rotulo}`],
+        b.cabecalho,
+        ...b.linhas
+      ];
       await sheets.spreadsheets.values.update({
         spreadsheetId, range: `${faixa}!A1`, valueInputOption: 'RAW',
         requestBody: {
-          values: [
-            [`Atualizado em ${agora} UTC — ${b.linhas.length} ${b.rotulo}`],
-            b.cabecalho,
-            ...b.linhas
-          ]
+          // Sanitiza AQUI, no ponto único de escrita, em vez de campo a campo lá em cima:
+          // as três abas passam por este mesmo lugar, então nenhuma coluna nova criada
+          // depois pode escapar por esquecimento.
+          values: valores.map(linha => linha.map(_sanitizarCelula))
         }
+      });
+      // Só AGORA apaga o que sobrou embaixo (resto de uma exportação maior). A ordem
+      // importa: limpando antes, uma falha de rede no meio deixava a aba VAZIA até o
+      // próximo backup dar certo. Escrevendo primeiro, uma falha preserva o conteúdo
+      // anterior — pior caso vira "dados desatualizados", não "dados sumiram".
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId, range: `${faixa}!A${valores.length + 1}:Z100000`
       });
     }
     return { ok: true, citacoes: linhasCitacoes.length, critica: linhasCritica.length, autores: linhasAutores.length };
@@ -350,7 +376,12 @@ app.post('/categorizar-lote', auth, async (req, res) => {
       method: 'POST',
       headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: modelo, max_tokens: Math.min(400 + limpos.length * 150, 8000),
+        // O orçamento precisa caber RESPOSTA + RACIOCÍNIO: com `thinking` ligado, os tokens
+        // de raciocínio saem deste mesmo teto. Com 150/citação, um lote de 20 no esforço
+        // alto raspava o limite e a resposta voltava cortada — o que aparecia como "algumas
+        // citações não foram preenchidas", sem erro visível. Folga generosa é barata aqui:
+        // max_tokens é teto, não consumo — não se paga o que não for gerado.
+        model: modelo, max_tokens: Math.min(1200 + limpos.length * 260, 16000),
         thinking: { type: 'adaptive' },
         output_config: { effort: esforco, format: { type: 'json_schema', schema } },
         system: sistema,
@@ -573,8 +604,18 @@ async function _gerarBackup() {
   // (rule `read: if false`) — nem o coordenador. Se a consulta falhar, o backup do resto
   // continua: perder o backup inteiro por causa disso seria pior.
   const privadosPorDono = {};
+  let privadosParciais = false;
   try {
-    const priv = await db.collectionGroup('privado').get();
+    // O collectionGroup varre a subcoleção `privado` de TODAS as citações — é de longe a
+    // leitura mais cara daqui. Com um teto de tempo, um dia ruim de rede degrada o backup
+    // (fica sem os comentários, e o relatório diz isso) em vez de derrubá-lo inteiro por
+    // estouro de tempo no cron. O restante do backup é mais importante do que esta parte.
+    let cronometro;
+    const priv = await Promise.race([
+      db.collectionGroup('privado').get(),
+      new Promise(resolve => { cronometro = setTimeout(() => resolve(null), 20000); })
+    ]).finally(() => clearTimeout(cronometro)); // sem isto o timer segura o processo por 20s
+    if (!priv) { privadosParciais = true; throw new Error('leitura dos comentários pessoais passou de 20s'); }
     priv.docs.forEach(d => {
       const citacaoId = d.ref.parent.parent ? d.ref.parent.parent.id : null;
       if (!citacaoId) return;
@@ -582,6 +623,7 @@ async function _gerarBackup() {
       (privadosPorDono[uid] = privadosPorDono[uid] || []).push({ citacaoId, ...d.data() });
     });
   } catch (e) {
+    privadosParciais = true;
     console.error('Não foi possível ler os comentários pessoais:', e.message);
   }
 
@@ -633,7 +675,11 @@ async function _gerarBackup() {
       compartilhadas: anotacoesCompartilhadas,
       privadas: anotacoesTotal - anotacoesCompartilhadas,
       pessoas: Object.keys(anotacoesPorDono).length
-    }
+    },
+    // Marca o backup como incompleto quando os comentários pessoais não puderam ser lidos.
+    // Backup que falha em silêncio é pior do que backup que falha: só se descobre na hora
+    // de restaurar, que é exatamente a hora em que não dá mais para consertar.
+    comentarios_incompletos: privadosParciais
   });
   await Promise.all(Object.entries(porCorrente).map(([corrente, itens]) =>
     docRef.collection('por_corrente').doc(_slug(corrente)).set({ corrente, citacoes: itens })
@@ -673,6 +719,7 @@ async function _gerarBackup() {
     // Anotações não vão para a planilha (é um espelho legível, e a maioria delas é privada);
     // ficam só no backup do Firestore, de onde o servidor sabe restaurá-las.
     anotacoes: { total: anotacoesTotal, pessoas: Object.keys(anotacoesPorDono).length },
+    comentarios_incompletos: privadosParciais,
     planilha
   };
 }
