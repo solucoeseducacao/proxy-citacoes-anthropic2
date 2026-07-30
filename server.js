@@ -730,10 +730,19 @@ app.post('/backup-diario', async (req, res) => {
     return res.status(403).json({ error: 'Não autorizado.' });
   }
   try {
-    res.json(await _gerarBackup());
+    // Resposta MÍNIMA de propósito. Quem chama esta rota é o cron-job.org, que armazena o
+    // corpo da resposta no histórico e marca a execução como "output too large" quando ela
+    // passa do limite dele — foi exactamente o que aconteceu em 28/07/2026, fazendo um
+    // backup BEM-SUCEDIDO ser registrado como falha. O backup é feito por _gerarBackup();
+    // aqui só se confirma o resultado em poucos bytes. O relatório completo continua na
+    // rota /backup-agora, que é a do botão no site e não tem limite de resposta.
+    const r = await _gerarBackup();
+    res.json({ ok: r.ok !== false, total: r.total ?? null, data: r.data ?? null });
   } catch (e) {
+    // Mensagem truncada pela mesma razão: erro do Google costuma vir com corpo longo, e uma
+    // falha registrada como "output too large" esconde qual foi a falha de verdade.
     console.error('Erro backup-diario:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: String(e.message || 'erro').slice(0, 200) });
   }
 });
 
