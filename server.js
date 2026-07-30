@@ -6,7 +6,10 @@
  * validado pelo token de login do Firebase.
  *
  * Variáveis de ambiente no Render:
- *   ANTHROPIC_API_KEY   = sk-ant-...        (obrigatória p/ IA)
+ *   ANTHROPIC_API_KEY   = sk-ant-...        (obrigatória p/ IA via Claude)
+ *   GEMINI_API_KEY      = ...               (opcional — só p/ usar modelos gemini-*;
+ *                          gerada em aistudio.google.com/apikey. Sem ela, tudo continua
+ *                          igual, só Claude. Teste depois de configurar: GET /gemini-teste)
  *   ALLOWED_ORIGIN      = https://grupo-de-pesquisa-9e35f.web.app (padrão já aponta p/ ela)
  *   FIREBASE_PROJECT_ID = grupo-de-pesquisa-9e35f                 (padrão já correto)
  *   FIREBASE_SERVICE_ACCOUNT_JSON = { ... } (obrigatória p/ backup diário — ver COMO-ATIVAR.md)
@@ -223,6 +226,9 @@ async function _exportarParaSheets({ citacoes = [], critica = [], autores = [] }
 
 const FELIPE = 'felipevigneron@gmail.com';
 const KEY = process.env.ANTHROPIC_API_KEY;
+// Gemini é OPCIONAL: sem GEMINI_API_KEY no ambiente, tudo continua funcionando exatamente
+// como antes (só Claude) — só falha, com mensagem clara, se alguém pedir um modelo gemini-*.
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
 const ALLOWED = (process.env.ALLOWED_ORIGIN || 'https://grupo-de-pesquisa-9e35f.web.app')
   .split(',').map(s => s.trim());
 
@@ -255,15 +261,25 @@ function rate(res) {
 }
 
 // Só modelos conhecidos podem ser pedidos. O cliente manda o `modelo` escolhido no seletor,
-// e um valor arbitrário vindo dali chegaria direto à Anthropic — restringir a esta lista
-// evita chamar (e pagar por) um modelo não previsto caso o campo seja adulterado.
+// e um valor arbitrário vindo dali chegaria direto à Anthropic/Gemini — restringir a esta
+// lista evita chamar (e pagar por) um modelo não previsto caso o campo seja adulterado.
+// Os IDs do Gemini foram checados na doc oficial em 2026-07-30 (ai.google.dev/gemini-api);
+// se a Google renomear/aposentar um modelo, ajustar só aqui.
 const MODELOS_PERMITIDOS = new Set([
   'claude-haiku-4-5', 'claude-sonnet-5', 'claude-sonnet-4-6',
-  'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-fable-5'
+  'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-fable-5',
+  'gemini-2.5-flash', 'gemini-2.0-flash'
 ]);
 const ESFORCOS_PERMITIDOS = new Set(['low', 'medium', 'high']);
 function modeloValido(m) { return MODELOS_PERMITIDOS.has(m) ? m : 'claude-sonnet-5'; }
 function esforcoValido(e) { return ESFORCOS_PERMITIDOS.has(e) ? e : 'medium'; }
+// "gemini-..." vai para a API do Google; qualquer outra coisa (todo o resto da allowlist)
+// continua indo para a Anthropic, como sempre.
+function _provedorDoModelo(m) { return typeof m === 'string' && m.startsWith('gemini') ? 'gemini' : 'claude'; }
+function _chaveFaltando(m) {
+  if (_provedorDoModelo(m) === 'gemini') return GEMINI_KEY ? null : 'Chave Gemini não configurada no servidor.';
+  return KEY ? null : 'Chave Anthropic não configurada no servidor.';
+}
 
 // Comparação de segredo em tempo constante: com `!==`, o tempo de resposta varia conforme
 // quantos caracteres iniciais batem, o que em tese permite descobrir o segredo por tentativa
@@ -329,12 +345,78 @@ function _blocoTemasEmUso(temas) {
  * é avaliada individualmente dentro do lote — o schema obriga a devolver o `indice` de cada uma,
  * e o cliente confere se voltou tudo (sem casar por posição, que sairia errado se faltar item).
  */
+
+// Chama o provedor certo (Claude ou Gemini) conforme o modelo pedido — usada pelas 3 rotas
+// de IA (categorizar, categorizar-lote, auditar), para não duplicar (e arriscar divergir) a
+// integração em cada uma. Contrato único de retorno:
+//   { ok, status, texto, uso, corpoErro }
+// `texto` é a string JSON bruta que a rota chamadora ainda faz JSON.parse; `uso` é
+// {input_tokens, output_tokens} nos dois provedores, para o cliente ler igual não importa
+// qual respondeu. Em falha, `corpoErro` já vem pronto para `res.status(r.status).json(...)`.
+//
+// O ramo Claude reproduz EXATAMENTE o request/response que cada rota já fazia sozinha antes
+// deste helper existir — zero mudança de comportamento para quem já usa Claude.
+async function _chamarModelo({ modelo, esforco, sistema, mensagem, schema, maxTokens }) {
+  if (_provedorDoModelo(modelo) === 'gemini') {
+    // Formato conferido em 2026-07-30 na doc oficial (ai.google.dev/api/generate-content):
+    // generationConfig em camelCase, schema em JSON Schema padrão (minúsculo) — mais simples
+    // que a geração anterior da API do Gemini, que exigia OBJECT/STRING em maiúsculas.
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent?key=${GEMINI_KEY}`;
+    let r, data;
+    try {
+      r = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: mensagem }] }],
+          systemInstruction: { parts: [{ text: sistema }] },
+          // Gemini não tem um parâmetro de "esforço" equivalente ao da Anthropic — não há
+          // o que mapear ainda; fica documentado aqui para quando/se a API expuser isso.
+          generationConfig: { responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: maxTokens }
+        })
+      });
+      data = await r.json();
+    } catch (e) {
+      return { ok: false, status: 502, texto: '', uso: null, corpoErro: { error: 'Falha ao contactar a API do Gemini: ' + e.message } };
+    }
+    if (!r.ok) {
+      const msg = (data && data.error && data.error.message) || JSON.stringify(data);
+      return { ok: false, status: r.status, texto: '', uso: null, corpoErro: { error: msg } };
+    }
+    const texto = (data && data.candidates && data.candidates[0] && data.candidates[0].content
+                   && data.candidates[0].content.parts && data.candidates[0].content.parts[0]
+                   && data.candidates[0].content.parts[0].text) || '';
+    const uso = data.usageMetadata
+      ? { input_tokens: data.usageMetadata.promptTokenCount, output_tokens: data.usageMetadata.candidatesTokenCount }
+      : null;
+    return { ok: true, status: 200, texto, uso, corpoErro: null };
+  }
+
+  // Claude — igual ao que cada rota fazia antes.
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: modelo, max_tokens: maxTokens,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: esforco, format: { type: 'json_schema', schema } },
+      system: sistema,
+      messages: [{ role: 'user', content: mensagem }]
+    })
+  });
+  const data = await r.json();
+  if (!r.ok) return { ok: false, status: r.status, texto: '', uso: null, corpoErro: data };
+  const bloco = (data.content || []).find(b => b.type === 'text');
+  return { ok: true, status: 200, texto: bloco ? bloco.text : '{}', uso: data.usage || null, corpoErro: null };
+}
+
 app.post('/categorizar-lote', auth, async (req, res) => {
-  if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
-  if (!rate(res)) return;
-  const { textos = [], temas_em_uso = [] } = req.body || {};
   const modelo = modeloValido((req.body || {}).modelo);
   const esforco = esforcoValido((req.body || {}).esforco);
+  const faltaChave = _chaveFaltando(modelo);
+  if (faltaChave) return res.status(500).json({ error: faltaChave });
+  if (!rate(res)) return;
+  const { textos = [], temas_em_uso = [] } = req.body || {};
 
   if (!Array.isArray(textos) || !textos.length) return res.status(400).json({ error: 'Envie "textos" como lista não vazia.' });
   if (textos.length > 25) return res.status(400).json({ error: 'Máximo de 25 citações por lote.' });
@@ -372,26 +454,18 @@ app.post('/categorizar-lote', auth, async (req, res) => {
   const conteudo = limpos.map((t, i) => `[${i}] ${t}`).join('\n\n---\n\n');
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({
-        // O orçamento precisa caber RESPOSTA + RACIOCÍNIO: com `thinking` ligado, os tokens
-        // de raciocínio saem deste mesmo teto. Com 150/citação, um lote de 20 no esforço
-        // alto raspava o limite e a resposta voltava cortada — o que aparecia como "algumas
-        // citações não foram preenchidas", sem erro visível. Folga generosa é barata aqui:
-        // max_tokens é teto, não consumo — não se paga o que não for gerado.
-        model: modelo, max_tokens: Math.min(1200 + limpos.length * 260, 16000),
-        thinking: { type: 'adaptive' },
-        output_config: { effort: esforco, format: { type: 'json_schema', schema } },
-        system: sistema,
-        messages: [{ role: 'user', content: 'Classifique cada citação:\n\n' + conteudo }]
-      })
+    // O orçamento precisa caber RESPOSTA + RACIOCÍNIO: com `thinking` ligado (Claude), os
+    // tokens de raciocínio saem deste mesmo teto. Com 150/citação, um lote de 20 no esforço
+    // alto raspava o limite e a resposta voltava cortada — o que aparecia como "algumas
+    // citações não foram preenchidas", sem erro visível. Folga generosa é barata aqui:
+    // max_tokens é teto, não consumo — não se paga o que não for gerado.
+    const r = await _chamarModelo({
+      modelo, esforco, sistema, schema,
+      mensagem: 'Classifique cada citação:\n\n' + conteudo,
+      maxTokens: Math.min(1200 + limpos.length * 260, 16000)
     });
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json(data);
-    const bloco = (data.content || []).find(b => b.type === 'text');
-    let out = {}; try { out = JSON.parse(bloco ? bloco.text : '{}'); } catch (_) { out = {}; }
+    if (!r.ok) return res.status(r.status).json(r.corpoErro);
+    let out = {}; try { out = JSON.parse(r.texto || '{}'); } catch (_) { out = {}; }
 
     // Devolve indexado por posição, preenchendo com vazio o que não voltou — assim o cliente
     // nunca associa a resposta de uma citação a outra por engano.
@@ -400,7 +474,7 @@ app.post('/categorizar-lote', auth, async (req, res) => {
       const achado = porIndice.get(i);
       return achado ? { tema: achado.tema || [], corrente: achado.corrente || '' } : null;
     });
-    res.json({ resultados, uso: data.usage || null });
+    res.json({ resultados, uso: r.uso });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -408,14 +482,15 @@ app.post('/categorizar-lote', auth, async (req, res) => {
 
 // Categorizar / reconhecer uma citação → { comentario, citacao, pagina, relacoes, tema[], corrente }
 app.post('/categorizar', auth, async (req, res) => {
-  if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
+  const modelo = modeloValido((req.body || {}).modelo);
+  const esforco = esforcoValido((req.body || {}).esforco);
+  const faltaChave = _chaveFaltando(modelo);
+  if (faltaChave) return res.status(500).json({ error: faltaChave });
   if (!rate(res)) return;
   const {
     texto = '', temas_em_uso = [],
     formato = 'Comentário - "citação" (página X) - outros comentários ou relações'
   } = req.body || {};
-  const modelo = modeloValido((req.body || {}).modelo);
-  const esforco = esforcoValido((req.body || {}).esforco);
   if (!texto || texto.length > 8000) return res.status(400).json({ error: 'Texto inválido.' });
 
   // Mesmas regras de tema/corrente do endpoint em lote (constante compartilhada acima):
@@ -437,21 +512,9 @@ app.post('/categorizar', auth, async (req, res) => {
   };
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: modelo, max_tokens: 1024,
-        thinking: { type: 'adaptive' },
-        output_config: { effort: esforco, format: { type: 'json_schema', schema } },
-        system: sistema,
-        messages: [{ role: 'user', content: texto }]
-      })
-    });
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json(data);
-    const bloco = (data.content || []).find(b => b.type === 'text');
-    let out = {}; try { out = JSON.parse(bloco ? bloco.text : '{}'); } catch (_) { out = {}; }
+    const r = await _chamarModelo({ modelo, esforco, sistema, schema, mensagem: texto, maxTokens: 1024 });
+    if (!r.ok) return res.status(r.status).json(r.corpoErro);
+    let out = {}; try { out = JSON.parse(r.texto || '{}'); } catch (_) { out = {}; }
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -465,14 +528,15 @@ app.post('/categorizar', auth, async (req, res) => {
 // Devolve { tem_problema, problemas:[...], sugestoes: {campo: novoValor, ...} } — só os
 // campos que a IA realmente sugere mudar aparecem em "sugestoes". Propõe, nunca aplica sozinha.
 app.post('/auditar', auth, async (req, res) => {
-  if (!KEY) return res.status(500).json({ error: 'Chave Anthropic não configurada no servidor.' });
+  const modelo = modeloValido((req.body || {}).modelo);
+  const esforco = esforcoValido((req.body || {}).esforco);
+  const faltaChave = _chaveFaltando(modelo);
+  if (faltaChave) return res.status(500).json({ error: faltaChave });
   if (!rate(res)) return;
   const {
     citacao = '', referencia_abnt = '', pagina = '', corrente_critica = '',
     tema = [], comentario = '', autor_obra = '', obra = ''
   } = req.body || {};
-  const modelo = modeloValido((req.body || {}).modelo);
-  const esforco = esforcoValido((req.body || {}).esforco);
   if (!citacao) return res.status(400).json({ error: 'Citação vazia.' });
 
   const sistema =
@@ -506,21 +570,12 @@ app.post('/auditar', auth, async (req, res) => {
   }, null, 2);
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: modelo, max_tokens: 1024,
-        thinking: { type: 'adaptive' },
-        output_config: { effort: esforco, format: { type: 'json_schema', schema } },
-        system: sistema,
-        messages: [{ role: 'user', content: 'Revise esta citação:\n' + contexto }]
-      })
+    const r = await _chamarModelo({
+      modelo, esforco, sistema, schema,
+      mensagem: 'Revise esta citação:\n' + contexto, maxTokens: 1024
     });
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json(data);
-    const bloco = (data.content || []).find(b => b.type === 'text');
-    let out = {}; try { out = JSON.parse(bloco ? bloco.text : '{}'); } catch (_) { out = {}; }
+    if (!r.ok) return res.status(r.status).json(r.corpoErro);
+    let out = {}; try { out = JSON.parse(r.texto || '{}'); } catch (_) { out = {}; }
 
     // Monta "sugestoes" só com os campos que a IA de fato preencheu (não vazios) —
     // o cliente só oferece para edição/aceite o que veio com conteúdo real.
@@ -539,6 +594,17 @@ app.post('/auditar', auth, async (req, res) => {
 });
 
 // Lista de modelos atuais da Anthropic (para o seletor) — ao vivo, com fallback
+// Gemini não tem uma Models API equivalente sendo consultada aqui (lista fixa, só os IDs em
+// MODELOS_PERMITIDOS) — e só aparece no seletor se a chave estiver configurada no ambiente,
+// para não oferecer no cliente uma opção que sabidamente vai falhar por falta de chave.
+function _modelosGemini() {
+  if (!GEMINI_KEY) return [];
+  return [
+    { id: 'gemini-2.5-flash', nome: 'Gemini 2.5 Flash (Google — melhor custo-benefício)' },
+    { id: 'gemini-2.0-flash', nome: 'Gemini 2.0 Flash (Google — mais antigo, estável)' }
+  ];
+}
+
 app.get('/modelos', auth, async (req, res) => {
   const rotulos = {
     'claude-haiku-4-5': 'Haiku 4.5 (rápido, econômico)',
@@ -546,7 +612,7 @@ app.get('/modelos', auth, async (req, res) => {
     'claude-opus-4-8':  'Opus 4.8 (máxima precisão)'
   };
   const ordem = ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-4-8'];
-  const fallback = () => ordem.map(id => ({ id, nome: rotulos[id] }));
+  const fallback = () => ordem.map(id => ({ id, nome: rotulos[id] })).concat(_modelosGemini());
   if (!KEY) return res.json({ modelos: fallback() });
   try {
     const r = await fetch('https://api.anthropic.com/v1/models?limit=100', {
@@ -562,10 +628,28 @@ app.get('/modelos', auth, async (req, res) => {
       if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
       return a.id.localeCompare(b.id);
     });
-    res.json({ modelos });
+    res.json({ modelos: modelos.concat(_modelosGemini()) });
   } catch (_) {
     res.json({ modelos: fallback() });
   }
+});
+
+// Smoke test da integração com o Gemini — não passou por teste ao vivo (esta chave não
+// existe neste ambiente de desenvolvimento), então é a forma de confirmar que a chamada
+// real funciona, com 1 clique, ANTES de usar o Gemini para categorizar citações de verdade.
+// Devolve o texto bruto da resposta e o erro (se houver) — em caso de falha, o corpo do erro
+// vem da própria Google, sem reformulação, para dar o diagnóstico exato do que travou.
+app.get('/gemini-teste', auth, async (req, res) => {
+  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY não configurada no servidor.' });
+  const r = await _chamarModelo({
+    modelo: 'gemini-2.0-flash', esforco: 'low',
+    sistema: 'Responda apenas com o JSON pedido, nada mais.',
+    mensagem: 'Diga "funcionando" no campo texto.',
+    schema: { type: 'object', properties: { texto: { type: 'string' } }, required: ['texto'] },
+    maxTokens: 100
+  });
+  if (!r.ok) return res.status(r.status).json({ ok: false, corpoErro: r.corpoErro });
+  res.json({ ok: true, resposta: r.texto });
 });
 
 // Slug simples para nome de documento (correntes viram nomes de doc na subcoleção)
@@ -974,7 +1058,7 @@ app.get('/conta-servico', auth, (_req, res) => {
 // Manual Deploy → Deploy latest commit. Sem um marcador não havia como saber, de fora, se o
 // que está no ar corresponde ao que está no repositório — todas as outras rotas exigem
 // credencial e respondem igual em qualquer versão. Atualizar esta string a cada mudança.
-const VERSAO = '2026-07-30 · backup-diario com resposta mínima';
+const VERSAO = '2026-07-30 · suporte a Gemini (GEMINI_API_KEY) + backup-diario com resposta mínima';
 app.get('/health', (_, res) => res.json({ ok: true, versao: VERSAO }));
 
 app.listen(process.env.PORT || 3000, () => console.log('Proxy de citações rodando'));
