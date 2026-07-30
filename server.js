@@ -639,17 +639,23 @@ app.get('/modelos', auth, async (req, res) => {
 // real funciona, com 1 clique, ANTES de usar o Gemini para categorizar citações de verdade.
 // Devolve o texto bruto da resposta e o erro (se houver) — em caso de falha, o corpo do erro
 // vem da própria Google, sem reformulação, para dar o diagnóstico exato do que travou.
+// ?modelo=gemini-2.5-flash (padrão 2.0) — aceita QUALQUER um dos dois, para diagnosticar se
+// um problema de cota é do modelo específico, não da chave ou do projeto (foi assim que se
+// descobriu, em 2026-07-30, que gemini-2.0-flash vinha com "limit: 0" enquanto era preciso
+// checar se 2.5-flash tinha cota de verdade).
 app.get('/gemini-teste', auth, async (req, res) => {
   if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY não configurada no servidor.' });
+  const modelo = modeloValido(req.query.modelo || 'gemini-2.0-flash');
+  if (_provedorDoModelo(modelo) !== 'gemini') return res.status(400).json({ error: '?modelo= precisa ser um modelo gemini-*.' });
   const r = await _chamarModelo({
-    modelo: 'gemini-2.0-flash', esforco: 'low',
+    modelo, esforco: 'low',
     sistema: 'Responda apenas com o JSON pedido, nada mais.',
     mensagem: 'Diga "funcionando" no campo texto.',
     schema: { type: 'object', properties: { texto: { type: 'string' } }, required: ['texto'] },
     maxTokens: 100
   });
-  if (!r.ok) return res.status(r.status).json({ ok: false, corpoErro: r.corpoErro });
-  res.json({ ok: true, resposta: r.texto });
+  if (!r.ok) return res.status(r.status).json({ ok: false, modelo, corpoErro: r.corpoErro });
+  res.json({ ok: true, modelo, resposta: r.texto });
 });
 
 // Slug simples para nome de documento (correntes viram nomes de doc na subcoleção)
