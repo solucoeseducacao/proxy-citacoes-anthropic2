@@ -261,16 +261,14 @@ function rate(res) {
 }
 
 // Só modelos conhecidos podem ser pedidos. O cliente manda o `modelo` escolhido no seletor,
-// e um valor arbitrário vindo dali chegaria direto à Anthropic/Gemini — restringir a esta
-// lista evita chamar (e pagar por) um modelo não previsto caso o campo seja adulterado.
-// Os IDs do Gemini foram checados na doc oficial em 2026-07-30 (ai.google.dev/gemini-api);
-// se a Google renomear/aposentar um modelo, ajustar só aqui.
+// e um valor arbitrário vindo dali chegaria direto à Anthropic/Gemini — restringir evita
+// chamar (e pagar por) um modelo não previsto caso o campo seja adulterado.
 const MODELOS_PERMITIDOS = new Set([
   'claude-haiku-4-5', 'claude-sonnet-5', 'claude-sonnet-4-6',
-  'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-fable-5',
-  'gemini-2.5-flash', 'gemini-2.0-flash'
+  'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-fable-5'
 ]);
 const ESFORCOS_PERMITIDOS = new Set(['low', 'medium', 'high']);
+// Síncrono, só para Claude — a allowlist fixa é segura porque nunca foi errada até hoje.
 function modeloValido(m) { return MODELOS_PERMITIDOS.has(m) ? m : 'claude-sonnet-5'; }
 function esforcoValido(e) { return ESFORCOS_PERMITIDOS.has(e) ? e : 'medium'; }
 // "gemini-..." vai para a API do Google; qualquer outra coisa (todo o resto da allowlist)
@@ -279,6 +277,48 @@ function _provedorDoModelo(m) { return typeof m === 'string' && m.startsWith('ge
 function _chaveFaltando(m) {
   if (_provedorDoModelo(m) === 'gemini') return GEMINI_KEY ? null : 'Chave Gemini não configurada no servidor.';
   return KEY ? null : 'Chave Anthropic não configurada no servidor.';
+}
+
+// NADA de lista fixa de modelos Gemini: em 2026-07-30, os dois IDs que eu tinha escrito à
+// mão (gemini-2.0-flash, gemini-2.5-flash) vieram um com cota zerada e outro "não disponível
+// para novos usuários" — a Google aposenta modelo mais rápido do que dá para acompanhar à
+// mão. A allowlist agora é a resposta AO VIVO da própria Models API do Google, para a CHAVE
+// REAL configurada: só aparece (e só é aceito) o que a Google confirma, agora, que existe e
+// que esta chave pode usar. Isso é o "sem mentir" que foi pedido — nunca um nome inventado.
+let _geminiModelosCache = null, _geminiModelosCacheEm = 0;
+const _GEMINI_CACHE_TTL = 6 * 3600 * 1000; // 6h, mesmo padrão já usado no SuperApp p/ Claude
+async function _listarModelosGemini() {
+  if (!GEMINI_KEY) return [];
+  const agora = Date.now();
+  if (_geminiModelosCache && agora - _geminiModelosCacheEm < _GEMINI_CACHE_TTL) return _geminiModelosCache;
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${GEMINI_KEY}`);
+    const data = await r.json();
+    if (!r.ok) { console.warn('[gemini] falha ao listar modelos:', data && data.error && data.error.message); return _geminiModelosCache || []; }
+    const modelos = (data.models || [])
+      .filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+      .map(m => ({
+        id: String(m.name || '').replace(/^models\//, ''),
+        nome: (m.displayName || String(m.name || '').replace(/^models\//, '')) + ' (Google)'
+      }))
+      .filter(m => m.id);
+    _geminiModelosCache = modelos; _geminiModelosCacheEm = agora;
+    return modelos;
+  } catch (e) {
+    console.warn('[gemini] erro ao listar modelos:', e.message);
+    return _geminiModelosCache || [];
+  }
+}
+// Versão ASSÍNCRONA de modeloValido, usada nas rotas de IA: Claude continua na allowlist
+// fixa (rápida, síncrona); um pedido de modelo gemini-* só é aceito se aparecer NA LISTA AO
+// VIVO acima — ou seja, se a própria Google confirma, agora, que esta chave pode usá-lo.
+async function _modeloValidoAsync(m) {
+  if (MODELOS_PERMITIDOS.has(m)) return m;
+  if (_provedorDoModelo(m) === 'gemini') {
+    const lista = await _listarModelosGemini();
+    if (lista.some(x => x.id === m)) return m;
+  }
+  return 'claude-sonnet-5';
 }
 
 // Comparação de segredo em tempo constante: com `!==`, o tempo de resposta varia conforme
@@ -411,7 +451,7 @@ async function _chamarModelo({ modelo, esforco, sistema, mensagem, schema, maxTo
 }
 
 app.post('/categorizar-lote', auth, async (req, res) => {
-  const modelo = modeloValido((req.body || {}).modelo);
+  const modelo = await _modeloValidoAsync((req.body || {}).modelo);
   const esforco = esforcoValido((req.body || {}).esforco);
   const faltaChave = _chaveFaltando(modelo);
   if (faltaChave) return res.status(500).json({ error: faltaChave });
@@ -482,7 +522,7 @@ app.post('/categorizar-lote', auth, async (req, res) => {
 
 // Categorizar / reconhecer uma citação → { comentario, citacao, pagina, relacoes, tema[], corrente }
 app.post('/categorizar', auth, async (req, res) => {
-  const modelo = modeloValido((req.body || {}).modelo);
+  const modelo = await _modeloValidoAsync((req.body || {}).modelo);
   const esforco = esforcoValido((req.body || {}).esforco);
   const faltaChave = _chaveFaltando(modelo);
   if (faltaChave) return res.status(500).json({ error: faltaChave });
@@ -528,7 +568,7 @@ app.post('/categorizar', auth, async (req, res) => {
 // Devolve { tem_problema, problemas:[...], sugestoes: {campo: novoValor, ...} } — só os
 // campos que a IA realmente sugere mudar aparecem em "sugestoes". Propõe, nunca aplica sozinha.
 app.post('/auditar', auth, async (req, res) => {
-  const modelo = modeloValido((req.body || {}).modelo);
+  const modelo = await _modeloValidoAsync((req.body || {}).modelo);
   const esforco = esforcoValido((req.body || {}).esforco);
   const faltaChave = _chaveFaltando(modelo);
   if (faltaChave) return res.status(500).json({ error: faltaChave });
@@ -597,14 +637,6 @@ app.post('/auditar', auth, async (req, res) => {
 // Gemini não tem uma Models API equivalente sendo consultada aqui (lista fixa, só os IDs em
 // MODELOS_PERMITIDOS) — e só aparece no seletor se a chave estiver configurada no ambiente,
 // para não oferecer no cliente uma opção que sabidamente vai falhar por falta de chave.
-function _modelosGemini() {
-  if (!GEMINI_KEY) return [];
-  return [
-    { id: 'gemini-2.5-flash', nome: 'Gemini 2.5 Flash (Google — melhor custo-benefício)' },
-    { id: 'gemini-2.0-flash', nome: 'Gemini 2.0 Flash (Google — mais antigo, estável)' }
-  ];
-}
-
 app.get('/modelos', auth, async (req, res) => {
   const rotulos = {
     'claude-haiku-4-5': 'Haiku 4.5 (rápido, econômico)',
@@ -612,7 +644,8 @@ app.get('/modelos', auth, async (req, res) => {
     'claude-opus-4-8':  'Opus 4.8 (máxima precisão)'
   };
   const ordem = ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-4-8'];
-  const fallback = () => ordem.map(id => ({ id, nome: rotulos[id] })).concat(_modelosGemini());
+  const gemini = await _listarModelosGemini(); // ao vivo — o que a chave REAL pode usar agora
+  const fallback = () => ordem.map(id => ({ id, nome: rotulos[id] })).concat(gemini);
   if (!KEY) return res.json({ modelos: fallback() });
   try {
     const r = await fetch('https://api.anthropic.com/v1/models?limit=100', {
@@ -628,25 +661,23 @@ app.get('/modelos', auth, async (req, res) => {
       if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
       return a.id.localeCompare(b.id);
     });
-    res.json({ modelos: modelos.concat(_modelosGemini()) });
+    res.json({ modelos: modelos.concat(gemini) });
   } catch (_) {
     res.json({ modelos: fallback() });
   }
 });
 
-// Smoke test da integração com o Gemini — não passou por teste ao vivo (esta chave não
-// existe neste ambiente de desenvolvimento), então é a forma de confirmar que a chamada
-// real funciona, com 1 clique, ANTES de usar o Gemini para categorizar citações de verdade.
-// Devolve o texto bruto da resposta e o erro (se houver) — em caso de falha, o corpo do erro
-// vem da própria Google, sem reformulação, para dar o diagnóstico exato do que travou.
-// ?modelo=gemini-2.5-flash (padrão 2.0) — aceita QUALQUER um dos dois, para diagnosticar se
-// um problema de cota é do modelo específico, não da chave ou do projeto (foi assim que se
-// descobriu, em 2026-07-30, que gemini-2.0-flash vinha com "limit: 0" enquanto era preciso
-// checar se 2.5-flash tinha cota de verdade).
+// Smoke test da integração com o Gemini. Sem ?modelo=, usa o PRIMEIRO da lista ao vivo (o que
+// a própria Google confirma que esta chave pode usar agora) — nunca um ID escrito à mão: foi
+// escrever à mão que deu errado em 2026-07-30 (2 IDs diferentes vieram invalidos/aposentados
+// para a chave real). Em caso de falha, o corpo do erro vem da própria Google, sem
+// reformulação, para dar o diagnóstico exato do que travou.
 app.get('/gemini-teste', auth, async (req, res) => {
   if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY não configurada no servidor.' });
-  const modelo = modeloValido(req.query.modelo || 'gemini-2.0-flash');
-  if (_provedorDoModelo(modelo) !== 'gemini') return res.status(400).json({ error: '?modelo= precisa ser um modelo gemini-*.' });
+  const lista = await _listarModelosGemini();
+  if (!lista.length) return res.status(502).json({ error: 'A Models API do Gemini não devolveu nenhum modelo utilizável para esta chave.' });
+  const pedido = req.query.modelo;
+  const modelo = (pedido && lista.some(x => x.id === pedido)) ? pedido : lista[0].id;
   const r = await _chamarModelo({
     modelo, esforco: 'low',
     sistema: 'Responda apenas com o JSON pedido, nada mais.',
