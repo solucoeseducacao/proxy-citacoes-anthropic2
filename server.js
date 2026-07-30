@@ -287,6 +287,15 @@ function _chaveFaltando(m) {
 // que esta chave pode usar. Isso é o "sem mentir" que foi pedido — nunca um nome inventado.
 let _geminiModelosCache = null, _geminiModelosCacheEm = 0;
 const _GEMINI_CACHE_TTL = 6 * 3600 * 1000; // 6h, mesmo padrão já usado no SuperApp p/ Claude
+// A mesma chave do Gemini dá acesso a TODA a linha de produtos de IA do Google, não só a
+// modelos de texto: "Nano Banana" (geração de IMAGEM), "Lyria" (MÚSICA), "Robotics-ER"
+// (controle de robô), "Deep Research"/"Antigravity Agent" (agentes autônomos complexos),
+// "Gemma" (família de modelo DIFERENTE do Gemini). Todos suportam generateContent segundo a
+// Models API, mas nenhum serve para classificar citação em JSON — confirmado em 2026-07-30,
+// quando essa lista "crua" veio com esses produtos misturados aos modelos de texto de
+// verdade. Filtro por nome, não só por capacidade: exclusão explícita das famílias que não
+// servem para este uso, e exige que o nome contenha "gemini" (defesa dupla).
+const _GEMINI_EXCLUIR = /\b(tts|gemma|nano\s*banana|omni|lyria|robotics|computer\s*use|deep\s*research|antigravity)\b/i;
 async function _listarModelosGemini() {
   if (!GEMINI_KEY) return [];
   const agora = Date.now();
@@ -297,6 +306,7 @@ async function _listarModelosGemini() {
     if (!r.ok) { console.warn('[gemini] falha ao listar modelos:', data && data.error && data.error.message); return _geminiModelosCache || []; }
     const modelos = (data.models || [])
       .filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+      .filter(m => /gemini/i.test(m.displayName || m.name || '') && !_GEMINI_EXCLUIR.test(m.displayName || m.name || ''))
       .map(m => ({
         id: String(m.name || '').replace(/^models\//, ''),
         nome: (m.displayName || String(m.name || '').replace(/^models\//, '')) + ' (Google)'
@@ -667,26 +677,34 @@ app.get('/modelos', auth, async (req, res) => {
   }
 });
 
-// Smoke test da integração com o Gemini. Sem ?modelo=, usa o PRIMEIRO da lista ao vivo (o que
-// a própria Google confirma que esta chave pode usar agora) — nunca um ID escrito à mão: foi
-// escrever à mão que deu errado em 2026-07-30 (2 IDs diferentes vieram invalidos/aposentados
-// para a chave real). Em caso de falha, o corpo do erro vem da própria Google, sem
-// reformulação, para dar o diagnóstico exato do que travou.
+// Smoke test da integração com o Gemini. "Aparecer na lista ao vivo" (Models API) NÃO
+// significa "pode ser chamado de verdade" — em 2026-07-30, gemini-2.5-flash aparecia listado
+// para esta chave, mas a Google recusava a chamada real com "no longer available to new
+// users". A lista serve só para saber que o modelo EXISTE; se é UTILIZÁVEL só se sabe
+// chamando. Por isso este teste TENTA de verdade, um por um (até 6, teto de segurança —
+// não é para percorrer o catálogo inteiro), e devolve o primeiro que responder, além do
+// relato de cada tentativa que falhou (para não esconder nada, "sem mentir").
+// Com ?modelo=, testa só esse (sem tentar outros), para checar um específico.
 app.get('/gemini-teste', auth, async (req, res) => {
   if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY não configurada no servidor.' });
   const lista = await _listarModelosGemini();
   if (!lista.length) return res.status(502).json({ error: 'A Models API do Gemini não devolveu nenhum modelo utilizável para esta chave.' });
   const pedido = req.query.modelo;
-  const modelo = (pedido && lista.some(x => x.id === pedido)) ? pedido : lista[0].id;
-  const r = await _chamarModelo({
-    modelo, esforco: 'low',
-    sistema: 'Responda apenas com o JSON pedido, nada mais.',
-    mensagem: 'Diga "funcionando" no campo texto.',
-    schema: { type: 'object', properties: { texto: { type: 'string' } }, required: ['texto'] },
-    maxTokens: 100
-  });
-  if (!r.ok) return res.status(r.status).json({ ok: false, modelo, corpoErro: r.corpoErro });
-  res.json({ ok: true, modelo, resposta: r.texto });
+  const candidatos = (pedido && lista.some(x => x.id === pedido)) ? [pedido] : lista.slice(0, 6).map(m => m.id);
+
+  const tentativas = [];
+  for (const modelo of candidatos) {
+    const r = await _chamarModelo({
+      modelo, esforco: 'low',
+      sistema: 'Responda apenas com o JSON pedido, nada mais.',
+      mensagem: 'Diga "funcionando" no campo texto.',
+      schema: { type: 'object', properties: { texto: { type: 'string' } }, required: ['texto'] },
+      maxTokens: 100
+    });
+    if (r.ok) return res.json({ ok: true, modelo, resposta: r.texto, tentativasAnteriores: tentativas });
+    tentativas.push({ modelo, status: r.status, erro: (r.corpoErro && r.corpoErro.error) || r.corpoErro });
+  }
+  res.status(502).json({ ok: false, erro: `Nenhum dos ${candidatos.length} modelo(s) testado(s) respondeu.`, tentativas });
 });
 
 // Slug simples para nome de documento (correntes viram nomes de doc na subcoleção)
