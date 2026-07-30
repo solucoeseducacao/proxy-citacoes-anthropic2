@@ -969,6 +969,12 @@ app.get('/conta-servico', auth, (_req, res) => {
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true }));
+// Marcador de versão. Este serviço foi criado no Render como "Public Git Repository", sem
+// conta do GitHub conectada: `git push` NÃO dispara redeploy, é preciso clicar
+// Manual Deploy → Deploy latest commit. Sem um marcador não havia como saber, de fora, se o
+// que está no ar corresponde ao que está no repositório — todas as outras rotas exigem
+// credencial e respondem igual em qualquer versão. Atualizar esta string a cada mudança.
+const VERSAO = '2026-07-30 · backup-diario com resposta mínima';
+app.get('/health', (_, res) => res.json({ ok: true, versao: VERSAO }));
 
 app.listen(process.env.PORT || 3000, () => console.log('Proxy de citações rodando'));
