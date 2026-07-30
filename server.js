@@ -1113,7 +1113,7 @@ app.get('/conta-servico', auth, (_req, res) => {
 // Manual Deploy → Deploy latest commit. Sem um marcador não havia como saber, de fora, se o
 // que está no ar corresponde ao que está no repositório — todas as outras rotas exigem
 // credencial e respondem igual em qualquer versão. Atualizar esta string a cada mudança.
-const VERSAO = '2026-07-30 · suporte a Gemini (GEMINI_API_KEY) + backup-diario com resposta mínima';
+const VERSAO = '2026-07-30 · gemini-teste tenta em sequencia + filtro so-texto-Gemini na lista de modelos';
 app.get('/health', (_, res) => res.json({ ok: true, versao: VERSAO }));
 
 app.listen(process.env.PORT || 3000, () => console.log('Proxy de citações rodando'));
