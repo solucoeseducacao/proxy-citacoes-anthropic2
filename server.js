@@ -406,6 +406,23 @@ function _blocoTemasEmUso(temas) {
 //
 // O ramo Claude reproduz EXATAMENTE o request/response que cada rota já fazia sozinha antes
 // deste helper existir — zero mudança de comportamento para quem já usa Claude.
+// O schema que as 3 rotas de IA montam usa `additionalProperties: false` — aceito pela
+// Anthropic, mas REJEITADO pelo Gemini: confirmado em 2026-07-30 por um erro real da própria
+// Google ("Unknown name 'additionalProperties': Cannot find field"), rodando de verdade no
+// site com uma citação real. Eu tinha presumido, sem testar, que o mesmo objeto de schema
+// serviria para os dois provedores — não serve. Esta função limpa uma CÓPIA do schema antes
+// de mandar para o Gemini (o schema original, intocado, continua indo para a Anthropic).
+function _paraEsquemaGemini(schema) {
+  if (Array.isArray(schema)) return schema.map(_paraEsquemaGemini);
+  if (!schema || typeof schema !== 'object') return schema;
+  const limpo = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === 'additionalProperties') continue; // único campo que a Google recusou até agora
+    limpo[k] = (v && typeof v === 'object') ? _paraEsquemaGemini(v) : v;
+  }
+  return limpo;
+}
+
 async function _chamarModelo({ modelo, esforco, sistema, mensagem, schema, maxTokens }) {
   if (_provedorDoModelo(modelo) === 'gemini') {
     // Formato conferido em 2026-07-30 na doc oficial (ai.google.dev/api/generate-content):
@@ -422,7 +439,7 @@ async function _chamarModelo({ modelo, esforco, sistema, mensagem, schema, maxTo
           systemInstruction: { parts: [{ text: sistema }] },
           // Gemini não tem um parâmetro de "esforço" equivalente ao da Anthropic — não há
           // o que mapear ainda; fica documentado aqui para quando/se a API expuser isso.
-          generationConfig: { responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: maxTokens }
+          generationConfig: { responseMimeType: 'application/json', responseSchema: _paraEsquemaGemini(schema), maxOutputTokens: maxTokens }
         })
       });
       data = await r.json();
