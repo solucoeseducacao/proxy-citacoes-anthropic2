@@ -311,7 +311,17 @@ async function _listarModelosGemini() {
         id: String(m.name || '').replace(/^models\//, ''),
         nome: (m.displayName || String(m.name || '').replace(/^models\//, '')) + ' (Google)'
       }))
-      .filter(m => m.id);
+      .filter(m => m.id)
+      // Testado ao vivo em 2026-07-30: TODA a geração 2.x (Flash e Pro) veio com cota
+      // zerada ("limit: 0") nesta conta, em 5 modelos diferentes; a geração 3.x (testado:
+      // 3.5 Flash) respondeu de verdade. Por isso só entram modelos com número de versão
+      // >= 3 — e aliases sem número (ex.: "gemini-flash-latest") ficam de fora também,
+      // porque não dá para saber, pelo nome, se apontam para uma geração viva ou morta.
+      // Se a Google reabrir cota para a 2.x, ou fechar a 3.x, isto precisa ser revisto.
+      .filter(m => {
+        const v = m.id.match(/gemini-(\d+(?:\.\d+)?)/i);
+        return v && parseFloat(v[1]) >= 3;
+      });
     _geminiModelosCache = modelos; _geminiModelosCacheEm = agora;
     return modelos;
   } catch (e) {
